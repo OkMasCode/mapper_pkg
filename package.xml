@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>mapper_pkg</name>
+  <version>0.0.0</version>
+  <description>C++ Semantic PointCloud Mapper using PCL and Bipartite Matching</description>
+  <maintainer email="francesco00masin@gmail.com">francesco</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+
+  <depend>message_filters</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <depend>cv_bridge</depend>
+  <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
+
+  <depend>yolo11_seg_interfaces</depend>
+
+  <build_depend>libpcl-all-dev</build_depend>
+  <exec_depend>libpcl-all</exec_depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+  
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
