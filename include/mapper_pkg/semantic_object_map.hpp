@@ -38,7 +38,7 @@ struct MapObject {
 
     std::string current_name;
     std::unordered_map<std::string, float> class_votes;
-    std::unordered_map<std::string, float> class_counts;
+    std::unordered_map<std::string, int> class_counts;
     std::unordered_map<std::string, float> class_conf_sums;
 
     float similarity;
@@ -101,8 +101,8 @@ class SemanticObjectMap {
             const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& new_points
         );
 
-        void updateChachedGeometry(MapObject& obj);
-        void updateChachedGeometry(TentativeTrack& track);
+        void updateCachedGeometry(MapObject& obj);
+        void updateCachedGeometry(TentativeTrack& track);
 
         bool updateTentative(
             const std::string& object_name, 
