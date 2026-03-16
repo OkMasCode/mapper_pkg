@@ -1,4 +1,4 @@
-#include "semantic_mapper_cpp/semantic_object_map.hpp" // Adjust path as needed
+#include "mapper_pkg/semantic_object_map.hpp" // Adjust path as needed
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/features/moment_of_inertia_estimation.h>
 #include <iostream>
