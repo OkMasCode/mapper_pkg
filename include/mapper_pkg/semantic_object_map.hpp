@@ -52,6 +52,16 @@ struct MapObject {
     Eigen::Vector3f obb_extents;
 };
 
+struct ValidDetection {
+    std::string name;
+    std::string track_id;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr points_map;
+    Eigen::Vector3f obb_extents; 
+    Eigen::Vector3f centroid;    
+    Eigen::VectorXf embedding;
+    float confidence;
+};
+
 class SemanticObjectMap {
     public:
 
@@ -81,6 +91,8 @@ class SemanticObjectMap {
         int confirmation_hits = 6;
         uint64_t confirmation_age = 800000000;
         int max_points = 5000;
+        int tentative_max_stale = 2000000000;
+        int binding_ttl = 4000000000;
 
     private:
 
