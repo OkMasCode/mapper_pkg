@@ -1,155 +1,198 @@
-#pragma once
+#ifndef SEMANTIC_OBJECT_MAP_HPP_
+#define SEMANTIC_OBJECT_MAP_HPP_
 
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <memory>
-#include <shared_mutex>
+#include <tuple>
 
-#include <Eigen/Dense>
-#include <pcl/point_types.h>
+// ROS 2 Time and Transforms
+#include <builtin_interfaces/msg/time.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+
+// PCL (Point Cloud Library)
 #include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 
-struct TentativeTrack {
-    std::string track_id;
-    std::string frame;
-    uint64_t first_seen_ns;
-    uint64_t last_seen_ns;
-    int hits;
-
-    std::string class_name;
-    float confidence_max;
-    float confidence_sum;
-
-    Eigen::VectorXf image_embedding;
-    float embedding_confidence_max;
-    pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
-
-    Eigen::Vector3f pose_map;
-    Eigen::Vector3f obb_extents;
+// Forward declaration of the OBB struct that we will implement in the .cpp file
+// based on the robinvista/pointcloud-OBB logic.
+struct OrientedBoundingBox {
+    std::vector<float> center{0.0f, 0.0f, 0.0f};
+    std::vector<float> extents{0.0f, 0.0f, 0.0f}; // length, width, height
+    // Rotational axes could be added here if needed for exact corner math
 };
+
+// ==========================================
+// 1. DATA STRUCTURES (Replaces Python @dataclass)
+// ==========================================
 
 struct MapObject {
     std::string map_id;
     std::string frame;
-    uint64_t first_seen_ns;
-    uint64_t last_seen_ns;
-    int occurrences;
-
+    builtin_interfaces::msg::Time timestamp;
+    
+    // Geometry
+    pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
+    OrientedBoundingBox obb; 
+    
+    // Tracking & Lifecycle
+    int occurrences = 0;
+    long long first_seen_ns = 0;
+    long long last_seen_ns = 0;
+    
+    // Semantic Voting
     std::string current_name;
     std::unordered_map<std::string, float> class_votes;
     std::unordered_map<std::string, int> class_counts;
     std::unordered_map<std::string, float> class_conf_sums;
+    
+    // Embeddings & Confidence
+    float similarity = 0.0f;
+    float confidence_ema = 0.0f;
+    std::vector<float> image_embedding;
+    float embedding_confidence_max = -1.0f;
+    std::string source_track_id;
 
-    float similarity;
-    float confidence_ema;
-
-    Eigen::VectorXf image_embedding;
-    float embedding_confidence_max;
-    pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
-
-    Eigen::Vector3f pose_map;
-    Eigen::Vector3f obb_extents;
+    // Cached state to prevent recomputing for ROS messages
+    std::vector<float> pose_cam{0.0f, 0.0f, 0.0f};
+    std::vector<float> pose_map{0.0f, 0.0f, 0.0f};
 };
 
-struct ValidDetection {
-    std::string name;
+struct TentativeTrack {
     std::string track_id;
-    pcl::PointCloud<pcl::PointXYZ>::Ptr points_map;
-    Eigen::Vector3f obb_extents; 
-    Eigen::Vector3f centroid;    
-    Eigen::VectorXf embedding;
-    float confidence;
+    std::string frame;
+    builtin_interfaces::msg::Time timestamp;
+    
+    // Geometry
+    pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
+    
+    // Tracking
+    int hits = 0;
+    long long first_seen_ns = 0;
+    long long last_seen_ns = 0;
+    
+    // Semantics
+    std::string class_name;
+    float confidence_max = 0.0f;
+    float confidence_sum = 0.0f;
+    std::vector<float> image_embedding;
+    float embedding_confidence_max = -1.0f;
 };
 
-class SemanticObjectMap {
-    public:
+// ==========================================
+// 2. THE MAPPER ENGINE
+// ==========================================
 
-        SemanticObjectMap();
-        ~SemanticObjectMap() = default;
+class SemanticObjectMapV5 {
+public:
+    SemanticObjectMapV5();
+    ~SemanticObjectMapV5() = default;
 
-        void addDetectionsBatch(
-            const std::vector<std::string>& object_names,
-            const std::vector<std::string>& tracker_ids,
-            uint64_t detection_stamp_ns,
-            const std::string& frame_id,
-            const std::vector<Eigen::VectorXf>& embeddings_list,
-            const std::vector<float>& confidences,
-            const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list
-        );
-
-        void resolveDuplicates();
-        void ExportJson(const std::string& directory_path, const std::string& file_name);
-        
-        std::unordered_map<std::string, MapObject> getObjectCopy() const;
-        
-        float w_dist = 1.0f;
-        float w_iou = 1.0f;
-        float w_sem = 2.5f;
-        float max_cost = 3.5f;
-
-        int confirmation_hits = 6;
-        uint64_t confirmation_age = 800000000;
-        int max_points = 5000;
-        int tentative_max_stale = 2000000000;
-        int binding_ttl = 4000000000;
-
-    private:
-
-        std::unordered_map<std::string, TentativeTrack> tentative_tracks_;
-        std::unordered_map<std::string, MapObject> objects_;
-        std::unordered_map<std::string, std::string> track_to_map_;
-        std::unordered_map<std::string, uint64_t> track_last_seen_;
-
-        int next_map_id_ = 1;
-
-        mutable std::shared_mutex map_mutex_;
-
-        void pruneStaleState(uint64_t current_ns);
-        std::string generateNewMapId();
-
-        pcl::PointCloud<pcl::PointXYZ>::Ptr fuseGeometry(
-            const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& old_points,
-            const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& new_points
-        );
-
-        void updateCachedGeometry(MapObject& obj);
-        void updateCachedGeometry(TentativeTrack& track);
-
-        bool updateTentative(
-            const std::string& object_name, 
-            const std::string& tracker_id,
-            pcl::PointCloud<pcl::PointXYZ>::Ptr& points_map, 
-            uint64_t current_ns, 
-            float confidence,
-            const Eigen::VectorXf& image_embedding, 
-            const std::string& frame
-        );
+    // The primary memory banks
+    std::unordered_map<std::string, MapObject> objects;
+    std::unordered_map<std::string, TentativeTrack> tentative_tracks;
     
-        void updateObject(
-            const std::string& map_id, 
-            const std::string& object_name,
-            pcl::PointCloud<pcl::PointXYZ>::Ptr& points_map, 
-            float confidence,
-            const Eigen::VectorXf& image_embedding, 
-            uint64_t current_ns,
-            const std::string& source_track_id
-        );
-    
-        void fuseObjects(const std::string& keep_id, const std::string& drop_id);
+    // Tracker relationships
+    std::unordered_map<std::string, std::string> track_to_map;
+    std::unordered_map<std::string, long long> track_last_seen_ns;
 
-        // Math and AI
-        Eigen::VectorXf fuseEmbeddingsRunningAvg(
-            const Eigen::VectorXf& cur_emb, int cur_count, 
-            const Eigen::VectorXf& new_emb, int new_count
-        );
+    // Tuning Parameters (Mapped directly from Python)
+    float min_input_confidence = 0.55f;
+    float min_detection_depth_m = 0.25f;
+    float max_detection_depth_m = 6.0f;
+    int confirmation_min_hits = 6;
+    float confirmation_time_window_sec = 2.5f;
+    float confirmation_min_age_sec = 0.8f;
+    float min_confidence_for_promotion = 0.50f;
+    float min_avg_confidence_for_promotion = 0.55f;
+    float tentative_max_stale_sec = 2.0f;
+    float binding_ttl_sec = 4.0f;
+    float confidence_ema_alpha = 0.20f;
+    
+    float class_count_weight = 1.0f;
+    float class_confidence_weight = 2.0f;
+    float class_switch_margin = 0.75f;
+    int min_class_votes_to_lock = 4;
+
+    // --- Core Public Interface ---
+
+    void add_detections_batch(
+        const std::vector<std::string>& object_names,
+        const std::vector<std::string>& tracker_ids,
+        const std::vector<float>& confidences,
+        const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list,
+        const builtin_interfaces::msg::Time& stamp,
+        const std::string& camera_frame,
+        const std::string& map_frame);
+
+    void resolve_overlapping_duplicates();
+    
+    void export_to_json(const std::string& directory_path, const std::string& file);
+
+    void refine_object_geometry(const std::string& map_id);
+    
+private:
+    int next_map_id_ = 1;
+
+    // --- State Management Helpers ---
+    
+    void prune_stale_state(long long current_ns);
+    std::string new_map_id();
+    long long stamp_to_ns(const builtin_interfaces::msg::Time& stamp);
+
+    // --- Geometry & Math Helpers ---
+    
+    std::vector<float> normalize_embedding(const std::vector<float>& embedding);
+    
+    std::vector<float> fuse_embeddings_running_avg(
+        const std::vector<float>& current_embedding, int current_count,
+        const std::vector<float>& new_embedding, int new_count);
         
-        float computeSemanticDistance(const Eigen::VectorXf& emb1, const Eigen::VectorXf& emb2);
-        float computeObbIou(const MapObject& obj1, const MapObject& obj2);
+    float compute_semantic_distance(
+        const std::vector<float>& emb1, 
+        const std::vector<float>& emb2);
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr fuse_geometry(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr old_points, 
+        pcl::PointCloud<pcl::PointXYZ>::Ptr new_points);
         
-        std::string chooseConsensusClass(
-            const std::unordered_map<std::string, int>& class_counts,
-            const std::unordered_map<std::string, float>& class_conf_sums,
-            const std::string& current_name
-        );
+    
+    OrientedBoundingBox compute_obb(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud);
+    
+    float compute_obb_iou(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2);
+
+    // --- Update Logic Helpers ---
+
+    bool update_tentative(
+        const std::string& object_name,
+        const std::string& tracker_id,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
+        const builtin_interfaces::msg::Time& detection_stamp,
+        float confidence,
+        const std::vector<float>& image_embedding,
+        long long current_ns,
+        const std::string& frame);
+
+    void update_object(
+        const std::string& map_id,
+        const std::string& object_name,
+        const builtin_interfaces::msg::Time& detection_stamp,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
+        float similarity,
+        float confidence,
+        const std::vector<float>& image_embedding,
+        long long current_ns,
+        const std::string& source_track_id);
+
+    void fuse_objects(const std::string& keep_id, const std::string& drop_id);
+
+    std::string choose_consensus_class(
+        const std::unordered_map<std::string, int>& class_counts,
+        const std::unordered_map<std::string, float>& class_conf_sums,
+        const std::string& current_name);
 };
+
+#endif // SEMANTIC_OBJECT_MAP_HPP_

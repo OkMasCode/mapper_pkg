@@ -41,9 +41,9 @@ if(BUILD_TESTING)
 endif()
 
 add_executable(mapper_node
-  src/main.cpp
   src/mapper_node.cpp
   src/semantic_object_map.cpp
+  src/Hungarian.cpp
 )
 
 target_include_directories(mapper_node PUBLIC
