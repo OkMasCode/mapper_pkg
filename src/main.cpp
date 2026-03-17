@@ -1,17 +1,19 @@
 #include <rclcpp/rclcpp.hpp>
-
-// We will include your ROS node header here once we write it
-// #include "semantic_mapper_cpp/mapper_node.hpp" 
+#include "semantic_mapper_cpp/mapper_node.hpp"
 
 int main(int argc, char **argv) {
-    // 1. Initialize the ROS 2 network
+    // 1. Initialize the ROS 2 network interfaces
     rclcpp::init(argc, argv);
 
-    // 2. Create the executor and the node (Commented out until we write mapper_node.hpp)
-    // auto node = std::make_shared<semantic_mapper::MapperNode>();
-    // rclcpp::spin(node);
+    // 2. Create the MapperNode instance as a shared pointer
+    auto node = std::make_shared<MapperNode>();
 
-    // 3. Clean shutdown
+    // 3. Spin the node so it continuously listens to the depth and YOLO topics
+    // This function blocks and will not return until the node is shut down (e.g., Ctrl+C)
+    rclcpp::spin(node);
+
+    // 4. Clean up resources and safely shut down the ROS 2 network
     rclcpp::shutdown();
+    
     return 0;
 }
