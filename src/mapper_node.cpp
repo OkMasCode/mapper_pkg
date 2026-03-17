@@ -1,4 +1,4 @@
-#include "semantic_mapper_cpp/mapper_node.hpp"
+#include "mapper_pkg/mapper_node.hpp"
 #include <cv_bridge/cv_bridge.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <pcl_ros/transforms.hpp> // Required for transforming Point Clouds

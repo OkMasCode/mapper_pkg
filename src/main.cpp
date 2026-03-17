@@ -1,5 +1,5 @@
 #include <rclcpp/rclcpp.hpp>
-#include "semantic_mapper_cpp/mapper_node.hpp"
+#include "mapper_pkg/mapper_node.hpp"
 
 int main(int argc, char **argv) {
     // 1. Initialize the ROS 2 network interfaces

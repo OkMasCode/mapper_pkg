@@ -163,8 +163,6 @@ std::unordered_map<std::string, MapObject> SemanticObjectMap::getObjectCopy() co
 // ==============================================================================
 
 void SemanticObjectMap::pruneStaleState(uint64_t current_ns) {
-    // 1. Lock the map for writing so no other threads can access it while we delete things
-    std::unique_lock<std::shared_mutex> lock(map_mutex_);
     
     // 2. Declare your local counter variables
     int removed_tentative = 0;

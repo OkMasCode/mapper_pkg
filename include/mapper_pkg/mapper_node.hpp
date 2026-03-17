@@ -10,7 +10,7 @@
 
 #include <yolo11_seg_interfaces/msg/detected_object_v3_array.hpp>
 
-#include "semantic_mapper_cpp/semantic_object_map.hpp"
+#include "mapper_pkg/semantic_object_map.hpp"
 
 class MapperNode : public rclcpp::Node {
 public:
