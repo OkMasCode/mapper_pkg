@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include <tuple>
+#include <chrono>
 
 // ROS 2 Core
 #include <rclcpp/rclcpp.hpp>
@@ -41,6 +42,21 @@
 
 // Forward declaration of the mapper logic class to keep this header clean
 class SemanticObjectMapV5;
+
+// Timing statistics structure for tracking step performance
+struct TimingStats {
+    double total_time_ms = 0.0;
+    int count = 0;
+    
+    double average() const {
+        return count > 0 ? total_time_ms / count : 0.0;
+    }
+    
+    void reset() {
+        total_time_ms = 0.0;
+        count = 0;
+    }
+};
 
 class PointCloudMapperNodeV5 : public rclcpp::Node {
 public:
@@ -133,6 +149,20 @@ private:
     rclcpp::Publisher<yolo11_seg_interfaces::msg::SemanticObjectArray>::SharedPtr map_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr stable_cloud_pub_;
     rclcpp::TimerBase::SharedPtr export_timer_;
+
+    // Timing statistics
+    TimingStats timing_depth_conversion_;
+    TimingStats timing_point_extraction_;
+    TimingStats timing_filtering_;
+    TimingStats timing_transformation_;
+    TimingStats timing_batch_addition_;
+    TimingStats timing_publishing_;
+    TimingStats timing_total_;
+    
+    int frame_count_ = 0;
+    std::chrono::steady_clock::time_point last_timing_print_;
+    
+    void print_timing_stats();
 };
 
 #endif // POINTCLOUD_MAPPER_NODE_V5_HPP_
