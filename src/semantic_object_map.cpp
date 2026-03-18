@@ -6,6 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <optional>
+#include <array>
 
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
@@ -16,6 +17,46 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl/kdtree/kdtree.h>
+
+namespace {
+
+inline bool obb_has_valid_shape(const OrientedBoundingBox& obb) {
+    return obb.center.size() >= 3 && obb.extents.size() >= 3 && obb.rotation.size() >= 9 &&
+           obb.extents[0] > 0.0f && obb.extents[1] > 0.0f && obb.extents[2] > 0.0f;
+}
+
+inline Eigen::Matrix3f rotation_from_obb(const OrientedBoundingBox& obb) {
+    Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
+    if (obb.rotation.size() >= 9) {
+        R(0, 0) = obb.rotation[0]; R(0, 1) = obb.rotation[1]; R(0, 2) = obb.rotation[2];
+        R(1, 0) = obb.rotation[3]; R(1, 1) = obb.rotation[4]; R(1, 2) = obb.rotation[5];
+        R(2, 0) = obb.rotation[6]; R(2, 1) = obb.rotation[7]; R(2, 2) = obb.rotation[8];
+    }
+    return R;
+}
+
+inline Eigen::Vector3f center_from_obb(const OrientedBoundingBox& obb) {
+    return Eigen::Vector3f(obb.center[0], obb.center[1], obb.center[2]);
+}
+
+inline bool point_inside_obb(const pcl::PointXYZ& p, const OrientedBoundingBox& obb, float eps = 1e-3f) {
+    if (!obb_has_valid_shape(obb)) {
+        return false;
+    }
+
+    const Eigen::Matrix3f R = rotation_from_obb(obb);
+    const Eigen::Vector3f c = center_from_obb(obb);
+    const Eigen::Vector3f w(p.x, p.y, p.z);
+    const Eigen::Vector3f local = R.transpose() * (w - c);
+
+    const float hx = 0.5f * obb.extents[0] + eps;
+    const float hy = 0.5f * obb.extents[1] + eps;
+    const float hz = 0.5f * obb.extents[2] + eps;
+
+    return std::fabs(local.x()) <= hx && std::fabs(local.y()) <= hy && std::fabs(local.z()) <= hz;
+}
+
+} // namespace
 
 // ---> MAKE SURE THIS FUNCTION EXISTS! <---
 SemanticObjectMapV5::SemanticObjectMapV5() {
@@ -129,33 +170,84 @@ OrientedBoundingBox SemanticObjectMapV5::compute_obb(pcl::PointCloud<pcl::PointX
 
     obb.center = {pcaCentroid(0), pcaCentroid(1), pcaCentroid(2)};
     obb.extents = {maxPoint.x - minPoint.x, maxPoint.y - minPoint.y, maxPoint.z - minPoint.z};
+    obb.rotation = {
+        eigenVectorsPCA(0, 0), eigenVectorsPCA(0, 1), eigenVectorsPCA(0, 2),
+        eigenVectorsPCA(1, 0), eigenVectorsPCA(1, 1), eigenVectorsPCA(1, 2),
+        eigenVectorsPCA(2, 0), eigenVectorsPCA(2, 1), eigenVectorsPCA(2, 2)
+    };
     
     return obb;
+}
+
+std::array<std::array<float, 3>, 8> SemanticObjectMapV5::compute_obb_corners(const OrientedBoundingBox& obb) const {
+    std::array<std::array<float, 3>, 8> corners{};
+
+    if (!obb_has_valid_shape(obb)) {
+        return corners;
+    }
+
+    const Eigen::Matrix3f R = rotation_from_obb(obb);
+    const Eigen::Vector3f c = center_from_obb(obb);
+    const float hx = 0.5f * obb.extents[0];
+    const float hy = 0.5f * obb.extents[1];
+    const float hz = 0.5f * obb.extents[2];
+
+    // Keep the same ordering expected by downstream visualization/export scripts.
+    const std::array<Eigen::Vector3f, 8> local = {
+        Eigen::Vector3f(-hx, -hy, -hz),
+        Eigen::Vector3f(+hx, -hy, -hz),
+        Eigen::Vector3f(-hx, +hy, -hz),
+        Eigen::Vector3f(-hx, -hy, +hz),
+        Eigen::Vector3f(+hx, +hy, +hz),
+        Eigen::Vector3f(-hx, +hy, +hz),
+        Eigen::Vector3f(+hx, -hy, +hz),
+        Eigen::Vector3f(+hx, +hy, -hz)
+    };
+
+    for (size_t i = 0; i < local.size(); ++i) {
+        const Eigen::Vector3f w = c + (R * local[i]);
+        corners[i] = {w.x(), w.y(), w.z()};
+    }
+
+    return corners;
 }
 
 float SemanticObjectMapV5::compute_obb_iou(
     pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
     pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2) 
 {
-    // Simplified 3D IoU Proxy: Distance gating since exact rotated 3D IoU is highly complex in C++
-    // We check if the centroids are close enough relative to their sizes.
-    if (obb1.extents[0] == 0 || obb2.extents[0] == 0) return 0.0f;
+    // Orientation-aware overlap proxy used in matching and map update logic.
+    return oriented_overlap_ratio(points1, obb1, points2, obb2);
+}
 
-    float dx = obb1.center[0] - obb2.center[0];
-    float dy = obb1.center[1] - obb2.center[1];
-    float dz = obb1.center[2] - obb2.center[2];
-    float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-
-    float max_size1 = std::max({obb1.extents[0], obb1.extents[1], obb1.extents[2]});
-    float max_size2 = std::max({obb2.extents[0], obb2.extents[1], obb2.extents[2]});
-    
-    float collision_dist = (max_size1 + max_size2) / 2.0f;
-
-    if (dist < collision_dist) {
-        // High overlap proxy
-        return 1.0f - (dist / collision_dist); 
+float SemanticObjectMapV5::oriented_overlap_ratio(
+    pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
+    pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2)
+{
+    if (!points1 || !points2 || points1->empty() || points2->empty()) {
+        return 0.0f;
     }
-    return 0.0f;
+    if (!obb_has_valid_shape(obb1) || !obb_has_valid_shape(obb2)) {
+        return 0.0f;
+    }
+
+    int in_1_in_2 = 0;
+    for (const auto& p : points1->points) {
+        if (point_inside_obb(p, obb2)) {
+            ++in_1_in_2;
+        }
+    }
+
+    int in_2_in_1 = 0;
+    for (const auto& p : points2->points) {
+        if (point_inside_obb(p, obb1)) {
+            ++in_2_in_1;
+        }
+    }
+
+    const float r12 = static_cast<float>(in_1_in_2) / static_cast<float>(std::max<size_t>(points1->points.size(), 1));
+    const float r21 = static_cast<float>(in_2_in_1) / static_cast<float>(std::max<size_t>(points2->points.size(), 1));
+    return std::clamp(0.5f * (r12 + r21), 0.0f, 1.0f);
 }
 
 void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {

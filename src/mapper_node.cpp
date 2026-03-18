@@ -372,33 +372,35 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
         obj_msg.pose_map.y = entry.pose_map[1];
         obj_msg.pose_map.z = entry.pose_map[2];
 
-        // Publish AABB proxy metadata derived from OBB extents and centroid.
+        // Publish true OBB metadata (extents + orientation + oriented corners).
         const float sx = std::max(0.0f, entry.obb.extents[0]);
         const float sy = std::max(0.0f, entry.obb.extents[1]);
         const float sz = std::max(0.0f, entry.obb.extents[2]);
-        const float cx = entry.pose_map[0];
-        const float cy = entry.pose_map[1];
-        const float cz = entry.pose_map[2];
 
-        obj_msg.bbox_type = "aabb";
+        obj_msg.bbox_type = "obb";
         obj_msg.box_size.x = sx;
         obj_msg.box_size.y = sy;
         obj_msg.box_size.z = sz;
 
-        const float hx = sx * 0.5f;
-        const float hy = sy * 0.5f;
-        const float hz = sz * 0.5f;
+        if (entry.obb.rotation.size() >= 9) {
+            Eigen::Matrix3f R;
+            R(0, 0) = entry.obb.rotation[0]; R(0, 1) = entry.obb.rotation[1]; R(0, 2) = entry.obb.rotation[2];
+            R(1, 0) = entry.obb.rotation[3]; R(1, 1) = entry.obb.rotation[4]; R(1, 2) = entry.obb.rotation[5];
+            R(2, 0) = entry.obb.rotation[6]; R(2, 1) = entry.obb.rotation[7]; R(2, 2) = entry.obb.rotation[8];
+            Eigen::Quaternionf q(R);
+            q.normalize();
+            obj_msg.bbox_orientation.x = static_cast<double>(q.x());
+            obj_msg.bbox_orientation.y = static_cast<double>(q.y());
+            obj_msg.bbox_orientation.z = static_cast<double>(q.z());
+            obj_msg.bbox_orientation.w = static_cast<double>(q.w());
+        } else {
+            obj_msg.bbox_orientation.x = 0.0;
+            obj_msg.bbox_orientation.y = 0.0;
+            obj_msg.bbox_orientation.z = 0.0;
+            obj_msg.bbox_orientation.w = 1.0;
+        }
 
-        const std::array<std::array<float, 3>, 8> corners = {{
-            {{cx - hx, cy - hy, cz - hz}},
-            {{cx + hx, cy - hy, cz - hz}},
-            {{cx + hx, cy + hy, cz - hz}},
-            {{cx - hx, cy + hy, cz - hz}},
-            {{cx - hx, cy - hy, cz + hz}},
-            {{cx + hx, cy - hy, cz + hz}},
-            {{cx + hx, cy + hy, cz + hz}},
-            {{cx - hx, cy + hy, cz + hz}}
-        }};
+        const auto corners = semantic_map_->compute_obb_corners(entry.obb);
 
         obj_msg.bbox_corners.clear();
         obj_msg.bbox_corners.reserve(corners.size());

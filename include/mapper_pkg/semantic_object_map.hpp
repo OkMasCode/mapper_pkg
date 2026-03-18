@@ -7,6 +7,7 @@
 #include <memory>
 #include <tuple>
 #include <optional>
+#include <array>
 
 // ROS 2 Time and Transforms
 #include <builtin_interfaces/msg/time.hpp>
@@ -21,7 +22,12 @@
 struct OrientedBoundingBox {
     std::vector<float> center{0.0f, 0.0f, 0.0f};
     std::vector<float> extents{0.0f, 0.0f, 0.0f}; // length, width, height
-    // Rotational axes could be added here if needed for exact corner math
+    // Row-major 3x3 rotation matrix for local->world transform.
+    std::vector<float> rotation{
+        1.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 1.0f
+    };
 };
 
 // ==========================================
@@ -133,6 +139,8 @@ public:
     void export_to_json(const std::string& directory_path, const std::string& file);
 
     void refine_object_geometry(const std::string& map_id);
+
+    std::array<std::array<float, 3>, 8> compute_obb_corners(const OrientedBoundingBox& obb) const;
     
 private:
     int next_map_id_ = 1;
@@ -163,6 +171,10 @@ private:
     OrientedBoundingBox compute_obb(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud);
     
     float compute_obb_iou(
+        pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
+        pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2);
+
+    float oriented_overlap_ratio(
         pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
         pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2);
 
