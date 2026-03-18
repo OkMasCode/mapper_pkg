@@ -4,6 +4,8 @@
 // PCL Headers for 3D filtering
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/segmentation/extract_clusters.h>
+#include <pcl/kdtree/kdtree.h>
 #include <pcl_conversions/pcl_conversions.h>
 
 // Standard C++ and System Headers
@@ -31,7 +33,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     export_interval_ = this->declare_parameter("export_interval", 3.0);
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
-    viewer_enabled_ = this->declare_parameter("viewer_enabled", true);
+    viewer_enabled_ = this->declare_parameter("viewer_enabled", false);
 
     // Initialize the core Semantic Mapper logic (The Brain)
     semantic_map_ = std::make_unique<SemanticObjectMapV5>();
@@ -252,17 +254,37 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size); 
         voxel_filter.filter(*downsampled_cloud);
 
-        // PCL 3D Filtering: Statistical Outlier Removal
+        // PCL 3D Filtering: Euclidean Clustering (keeps only largest contiguous cluster)
+        // This removes ALL isolated/distant points even if they form clusters
         pcl::PointCloud<pcl::PointXYZ>::Ptr clean_cloud(new pcl::PointCloud<pcl::PointXYZ>());
-        if (downsampled_cloud->points.size() > 7) {
-            pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
-            sor.setInputCloud(downsampled_cloud);
-            sor.setMeanK(10);
-            sor.setStddevMulThresh(2.0);
-            sor.filter(*clean_cloud);
+        if (downsampled_cloud->points.size() > 10) {
+            pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+            tree->setInputCloud(downsampled_cloud);
+
+            std::vector<pcl::PointIndices> cluster_indices;
+            pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+            ec.setClusterTolerance(0.06);    // 6cm distance to stay in same cluster
+            ec.setMinClusterSize(5);         // Minimum 5 points per cluster
+            ec.setMaxClusterSize(50000);     // Max cluster size (keep large objects)
+            ec.setSearchMethod(tree);
+            ec.setInputCloud(downsampled_cloud);
+            ec.extract(cluster_indices);
+
+            if (!cluster_indices.empty()) {
+                // Keep only the LARGEST cluster (main object, not outliers)
+                const auto& largest_cluster = cluster_indices[0];
+                for (const auto& idx : largest_cluster.indices) {
+                    clean_cloud->points.push_back(downsampled_cloud->points[idx]);
+                }
+            } else {
+                clean_cloud = downsampled_cloud;
+            }
         } else {
             clean_cloud = downsampled_cloud;
         }
+        clean_cloud->width = clean_cloud->points.size();
+        clean_cloud->height = 1;
+        clean_cloud->is_dense = true;
         
         auto t_filter_end = std::chrono::steady_clock::now();
         timing_filtering_.total_time_ms += std::chrono::duration<double, std::milli>(t_filter_end - t_filter_start).count();

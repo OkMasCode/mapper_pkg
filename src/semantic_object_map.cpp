@@ -599,8 +599,8 @@ void SemanticObjectMapV5::add_detections_batch(
     int M = map_ids.size();
     std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, 0.0));
 
-    double w_dist = 1.0, w_iou = 1.0, w_sem = 2.5;
-    double MAX_COST = 3.5;
+    double w_dist = 1.0, w_iou = 2.0, w_sem = 2.5;
+    double MAX_COST = 4.0;
 
     for (int i = 0; i < N; ++i) {
         int det_idx = unmatched_indices[i];
@@ -615,7 +615,7 @@ void SemanticObjectMapV5::add_detections_batch(
             double dz = det_obb.center[2] - map_obj.pose_map[2];
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
             
-            if (dist > 1.5) {
+            if (dist > 0.9) {
                 costMatrix[i][j] = 999.0;
                 continue;
             }
