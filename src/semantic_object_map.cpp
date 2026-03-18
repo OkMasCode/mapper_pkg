@@ -5,6 +5,7 @@
 #include <numeric>
 #include <cmath>
 #include <algorithm>
+#include <optional>
 
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
@@ -79,11 +80,11 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
 
     if (combined->empty()) return combined;
 
-    // Voxel downsample to merge overlapping points and keep memory clean (5cm)
+    // Voxel downsample to merge overlapping points and keep memory clean (7cm)
     pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZ>());
     pcl::VoxelGrid<pcl::PointXYZ> grid;
     grid.setInputCloud(combined);
-    grid.setLeafSize(0.05f, 0.05f, 0.05f);
+    grid.setLeafSize(0.007f, 0.007f, 0.007f);
     grid.filter(*downsampled);
     
     return downsampled;
@@ -161,8 +162,8 @@ void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {
 
     std::vector<pcl::PointIndices> cluster_indices;
     pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-    ec.setClusterTolerance(0.18); // 18cm distance to keep cluster together
-    ec.setMinClusterSize(10);
+    ec.setClusterTolerance(0.06); // 6cm distance to keep cluster together
+    ec.setMinClusterSize(70);
     ec.setMaxClusterSize(25000);
     ec.setSearchMethod(tree);
     ec.setInputCloud(obj.accumulated_points);
@@ -277,9 +278,13 @@ void SemanticObjectMapV5::update_object(
 
     entry.current_name = choose_consensus_class(entry.class_counts, entry.class_conf_sums, entry.current_name);
     entry.confidence_ema = ((1.0f - confidence_ema_alpha) * entry.confidence_ema) + (confidence_ema_alpha * confidence);
-    
-    entry.image_embedding = fuse_embeddings_running_avg(entry.image_embedding, entry.occurrences, image_embedding, 1);
-    entry.embedding_confidence_max = std::max(entry.embedding_confidence_max, confidence);
+
+    if (!image_embedding.empty()) {
+        entry.image_embedding = fuse_embeddings_running_avg(entry.image_embedding, entry.occurrences, image_embedding, 1);
+        entry.embedding_confidence_max = std::max(entry.embedding_confidence_max, confidence);
+    }
+
+    entry.similarity = std::isfinite(similarity) ? similarity : 0.0f;
 
     entry.occurrences += 1;
     entry.last_seen_ns = current_ns;
@@ -329,8 +334,10 @@ bool SemanticObjectMapV5::update_tentative(
         t.class_name = object_name;
         t.confidence_max = confidence;
         t.confidence_sum = confidence;
-        t.image_embedding = normalize_embedding(image_embedding);
-        t.embedding_confidence_max = confidence;
+        if (!image_embedding.empty()) {
+            t.image_embedding = normalize_embedding(image_embedding);
+            t.embedding_confidence_max = confidence;
+        }
         tentative_tracks[tracker_id] = t;
 
         std::cout << "[SemanticObjectMap] tentative create: track=" << tracker_id
@@ -345,8 +352,10 @@ bool SemanticObjectMapV5::update_tentative(
     t.timestamp = detection_stamp;
     t.confidence_sum += confidence;
     t.confidence_max = std::max(t.confidence_max, confidence);
-    t.embedding_confidence_max = std::max(t.embedding_confidence_max, confidence);
-    t.image_embedding = fuse_embeddings_running_avg(t.image_embedding, t.hits - 1, image_embedding, 1);
+    if (!image_embedding.empty()) {
+        t.embedding_confidence_max = std::max(t.embedding_confidence_max, confidence);
+        t.image_embedding = fuse_embeddings_running_avg(t.image_embedding, t.hits - 1, image_embedding, 1);
+    }
 
     if (confidence >= t.confidence_max || t.class_name.empty()) {
         t.class_name = object_name;
@@ -412,6 +421,7 @@ void SemanticObjectMapV5::add_detections_batch(
     const std::vector<std::string>& tracker_ids,
     const std::vector<float>& confidences,
     const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list,
+    const std::vector<std::optional<std::vector<float>>>& embeddings_list,
     const builtin_interfaces::msg::Time& stamp,
     const std::string& camera_frame,
     const std::string& map_frame)
@@ -420,10 +430,11 @@ void SemanticObjectMapV5::add_detections_batch(
 
     if (object_names.size() != points_cam_list.size() ||
         tracker_ids.size() != points_cam_list.size() ||
-        confidences.size() != points_cam_list.size()) {
+        confidences.size() != points_cam_list.size() ||
+        embeddings_list.size() != points_cam_list.size()) {
         std::cout << "[SemanticObjectMap] batch skip: size mismatch names=" << object_names.size()
                   << " tracks=" << tracker_ids.size() << " conf=" << confidences.size()
-                  << " points=" << points_cam_list.size() << "\n";
+                  << " points=" << points_cam_list.size() << " embeddings=" << embeddings_list.size() << "\n";
         return;
     }
 
@@ -443,7 +454,13 @@ void SemanticObjectMapV5::add_detections_batch(
             
             // Safety Gate: Do not trust tracker if class suddenly flips
             if (object_names[i] == objects[map_id].current_name) {
-                update_object(map_id, object_names[i], stamp, points_cam_list[i], 0.0, confidences[i], {}, current_ns, t_id);
+                const std::vector<float> image_embedding = embeddings_list[i].has_value() ? embeddings_list[i].value() : std::vector<float>{};
+                float similarity = 0.0f;
+                const auto& map_obj = objects[map_id];
+                if (!image_embedding.empty() && !map_obj.image_embedding.empty()) {
+                    similarity = std::clamp(1.0f - compute_semantic_distance(image_embedding, map_obj.image_embedding), 0.0f, 1.0f);
+                }
+                update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding, current_ns, t_id);
                 track_last_seen_ns[t_id] = current_ns;
                 matched = true;
             }
@@ -464,13 +481,14 @@ void SemanticObjectMapV5::add_detections_batch(
         std::cout << "[SemanticObjectMap] map empty: routing " << unmatched_indices.size()
                   << " detections to tentative tracks\n";
         for (int det_idx : unmatched_indices) {
+            const std::vector<float> image_embedding = embeddings_list[det_idx].has_value() ? embeddings_list[det_idx].value() : std::vector<float>{};
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
                 points_cam_list[det_idx],
                 stamp,
                 confidences[det_idx],
-                {},
+                image_embedding,
                 current_ns,
                 map_frame.empty() ? camera_frame : map_frame);
         }
@@ -504,7 +522,10 @@ void SemanticObjectMapV5::add_detections_batch(
 
             // Geometric & Semantic
             double iou = compute_obb_iou(points_cam_list[det_idx], det_obb, map_obj.accumulated_points, map_obj.obb);
-            double cost_sem = 0.0; // Assume 0 if no embeddings for speed
+            double cost_sem = 1.0;
+            if (embeddings_list[det_idx].has_value() && !map_obj.image_embedding.empty()) {
+                cost_sem = static_cast<double>(compute_semantic_distance(embeddings_list[det_idx].value(), map_obj.image_embedding));
+            }
 
             double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 5.0 : 0.0;
 
@@ -524,18 +545,25 @@ void SemanticObjectMapV5::add_detections_batch(
         // If matched and the cost is under the maximum threshold
         if (map_idx >= 0 && costMatrix[i][map_idx] < MAX_COST) {
             std::string m_id = map_ids[map_idx];
-            update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], 0.0, confidences[det_idx], {}, current_ns, tracker_ids[det_idx]);
+            const std::vector<float> image_embedding = embeddings_list[det_idx].has_value() ? embeddings_list[det_idx].value() : std::vector<float>{};
+            float similarity = 0.0f;
+            const auto& map_obj = objects[m_id];
+            if (!image_embedding.empty() && !map_obj.image_embedding.empty()) {
+                similarity = std::clamp(1.0f - compute_semantic_distance(image_embedding, map_obj.image_embedding), 0.0f, 1.0f);
+            }
+            update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding, current_ns, tracker_ids[det_idx]);
             track_to_map[tracker_ids[det_idx]] = m_id;
             track_last_seen_ns[tracker_ids[det_idx]] = current_ns;
         } else {
             // PHASE 3: Spawn New Tentative Tracks
+            const std::vector<float> image_embedding = embeddings_list[det_idx].has_value() ? embeddings_list[det_idx].value() : std::vector<float>{};
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
                 points_cam_list[det_idx],
                 stamp,
                 confidences[det_idx],
-                {},
+                image_embedding,
                 current_ns,
                 map_frame.empty() ? camera_frame : map_frame);
         }

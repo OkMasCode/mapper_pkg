@@ -22,7 +22,7 @@
 #include <tf2_ros/transform_listener.h>
 
 // OpenCV & CV Bridge for Image manipulation
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/opencv.hpp>
 
 // Message Filters for Exact/Approximate Time Synchronization
@@ -98,7 +98,8 @@ private:
     std::string output_dir_;
     std::string output_map_file_;
     std::string stable_pointcloud_topic_;
-    
+    bool viewer_enabled_;
+
     double export_interval_;
     bool publish_stable_pointcloud_enabled_;
     

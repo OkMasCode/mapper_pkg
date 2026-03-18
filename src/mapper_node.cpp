@@ -9,6 +9,8 @@
 // Standard C++ and System Headers
 #include <zlib.h> // For CRC32 deterministic coloring
 #include <chrono>
+#include <optional>
+#include <array>
 #include <Eigen/Geometry>
 #include <pcl/common/transforms.h>
 #include <tf2/exceptions.h>
@@ -21,13 +23,14 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
 
     // 1. Declare and load core I/O parameters
     dm_topic_ = this->declare_parameter("detection_message", "/vision/detections");
-    map_frame_ = this->declare_parameter("map_frame", "map");
+    map_frame_ = this->declare_parameter("map_frame", "camera_color_optical_frame");
     camera_frame_ = this->declare_parameter("camera_frame", "camera_color_optical_frame");
     output_dir_ = this->declare_parameter("output_dir", "/workspaces/ros2_ws/src/yolo11_seg_bringup/config/");
     output_map_file_ = this->declare_parameter("output_map_file", "map_v5.json");
     export_interval_ = this->declare_parameter("export_interval", 3.0);
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
+    viewer_enabled_ = this->declare_parameter("viewer_enabled", false);
 
     // Initialize the core Semantic Mapper logic (The Brain)
     semantic_map_ = std::make_unique<SemanticObjectMapV5>();
@@ -56,12 +59,12 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
 
     // 6. Setup Subscribers
     cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-        "/camera/depth/camera_info", qos, 
+        "/camera/camera/depth/camera_info", qos, 
         std::bind(&PointCloudMapperNodeV5::camera_info_cb, this, _1)
     );
 
     mask_sub_.subscribe(this, dm_topic_, qos.get_rmw_qos_profile());
-    depth_sub_.subscribe(this, "/camera/depth", qos.get_rmw_qos_profile());
+    depth_sub_.subscribe(this, "/camera/camera/aligned_depth_to_color/image_raw", qos.get_rmw_qos_profile());
 
     // 7. Setup Approximate Time Synchronizer (Queue size = 10)
     sync_ = std::make_shared<Sync>(SyncPolicy(10), mask_sub_, depth_sub_);
@@ -69,8 +72,9 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
 
     // 8. Setup Publishers & Timers
     map_pub_ = this->create_publisher<yolo11_seg_interfaces::msg::SemanticObjectArray>("/vision/semantic_map_v5", 10);
-    stable_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(stable_pointcloud_topic_, 10);
-    
+    if (viewer_enabled_) {
+        stable_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(stable_pointcloud_topic_, 10);
+    }
     export_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(export_interval_),
         std::bind(&PointCloudMapperNodeV5::export_callback, this)
@@ -103,7 +107,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr PointCloudMapperNodeV5::get_points_in_mask(
                 float z = depth_m.at<float>(v, u);
                 
                 // Depth gating (e.g., 0.25m to 4.0m)
-                if (std::isfinite(z) && z >= 0.25f && z <= 4.0f) {
+                if (std::isfinite(z) && z >= 0.1f && z <= 4.0f) {
                     pcl::PointXYZ pt;
                     pt.x = (u - cx_) * z / fx_;
                     pt.y = (v - cy_) * z / fy_;
@@ -188,6 +192,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     std::vector<std::string> tracker_ids;
     std::vector<float> confidences;
     std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> points_cam_list;
+    std::vector<std::optional<std::vector<float>>> embeddings_list;
 
     int accepted_detections = 0;
 
@@ -212,11 +217,11 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             continue;
         }
 
-        // PCL 3D Filtering: Voxel downsample (0.05m = 5cm)
+        // PCL 3D Filtering: Voxel downsample (0.006m = 6mm)
         pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
         voxel_filter.setInputCloud(raw_cloud);
-        voxel_filter.setLeafSize(0.01f, 0.01f, 0.01f); 
+        voxel_filter.setLeafSize(0.006f, 0.006f, 0.006f); 
         voxel_filter.filter(*downsampled_cloud);
 
         // PCL 3D Filtering: Statistical Outlier Removal
@@ -250,6 +255,11 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         tracker_ids.push_back(std::to_string(det.instance_id));
         confidences.push_back(det.confidence);
         points_cam_list.push_back(cloud_map);
+        if (!det.embedding.empty()) {
+            embeddings_list.emplace_back(det.embedding);
+        } else {
+            embeddings_list.emplace_back(std::nullopt);
+        }
         accepted_detections++;
     }
 
@@ -260,7 +270,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     // 3. Pass the batch to the Semantic Mapper Logic (The Bipartite Matrix)
     if (!points_cam_list.empty()) {
         semantic_map_->add_detections_batch(
-            object_names, tracker_ids, confidences, points_cam_list,
+            object_names, tracker_ids, confidences, points_cam_list, embeddings_list,
             mask_msg->header.stamp, camera_frame_, map_frame_
         );
     } else {
@@ -303,6 +313,44 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
         obj_msg.pose_map.x = entry.pose_map[0];
         obj_msg.pose_map.y = entry.pose_map[1];
         obj_msg.pose_map.z = entry.pose_map[2];
+
+        // Publish AABB proxy metadata derived from OBB extents and centroid.
+        const float sx = std::max(0.0f, entry.obb.extents[0]);
+        const float sy = std::max(0.0f, entry.obb.extents[1]);
+        const float sz = std::max(0.0f, entry.obb.extents[2]);
+        const float cx = entry.pose_map[0];
+        const float cy = entry.pose_map[1];
+        const float cz = entry.pose_map[2];
+
+        obj_msg.bbox_type = "aabb";
+        obj_msg.box_size.x = sx;
+        obj_msg.box_size.y = sy;
+        obj_msg.box_size.z = sz;
+
+        const float hx = sx * 0.5f;
+        const float hy = sy * 0.5f;
+        const float hz = sz * 0.5f;
+
+        const std::array<std::array<float, 3>, 8> corners = {{
+            {{cx - hx, cy - hy, cz - hz}},
+            {{cx + hx, cy - hy, cz - hz}},
+            {{cx + hx, cy + hy, cz - hz}},
+            {{cx - hx, cy + hy, cz - hz}},
+            {{cx - hx, cy - hy, cz + hz}},
+            {{cx + hx, cy - hy, cz + hz}},
+            {{cx + hx, cy + hy, cz + hz}},
+            {{cx - hx, cy + hy, cz + hz}}
+        }};
+
+        obj_msg.bbox_corners.clear();
+        obj_msg.bbox_corners.reserve(corners.size());
+        for (const auto& c : corners) {
+            geometry_msgs::msg::Point p;
+            p.x = static_cast<double>(c[0]);
+            p.y = static_cast<double>(c[1]);
+            p.z = static_cast<double>(c[2]);
+            obj_msg.bbox_corners.push_back(p);
+        }
         
         obj_msg.occurrences = entry.occurrences;
         obj_msg.similarity = entry.similarity;
@@ -354,9 +402,13 @@ void PointCloudMapperNodeV5::publish_stable_pointcloud() {
     cloud_msg.header.stamp = this->get_clock()->now();
     cloud_msg.header.frame_id = map_frame_;
 
-    stable_cloud_pub_->publish(cloud_msg);
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+    
+    if (viewer_enabled_) {
+        stable_cloud_pub_->publish(cloud_msg);
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "[mapper_node_v5:publish_cloud] published_points=%zu", colored_cloud->points.size());
+    }
+    
 }
 
 std::tuple<uint8_t, uint8_t, uint8_t> PointCloudMapperNodeV5::class_to_color_rgb(const std::string& class_name) {

@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <memory>
 #include <tuple>
+#include <optional>
 
 // ROS 2 Time and Transforms
 #include <builtin_interfaces/msg/time.hpp>
@@ -122,6 +123,7 @@ public:
         const std::vector<std::string>& tracker_ids,
         const std::vector<float>& confidences,
         const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list,
+        const std::vector<std::optional<std::vector<float>>>& embeddings_list,
         const builtin_interfaces::msg::Time& stamp,
         const std::string& camera_frame,
         const std::string& map_frame);
