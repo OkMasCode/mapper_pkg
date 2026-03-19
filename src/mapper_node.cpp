@@ -26,10 +26,10 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
 
     // 1. Declare and load core I/O parameters
     dm_topic_ = this->declare_parameter("detection_message", "/vision/detections");
-    map_frame_ = this->declare_parameter("map_frame", "camera_color_optical_frame");
+    map_frame_ = this->declare_parameter("map_frame", "map");
     camera_frame_ = this->declare_parameter("camera_frame", "camera_color_optical_frame");
     output_dir_ = this->declare_parameter("output_dir", "/workspaces/ros2_ws/src/yolo11_seg_bringup/config/");
-    output_map_file_ = this->declare_parameter("output_map_file", "map_v5.json");
+    output_map_file_ = this->declare_parameter("output_map_file", "map_v6.json");
     export_interval_ = this->declare_parameter("export_interval", 3.0);
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
@@ -65,12 +65,12 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
 
     // 6. Setup Subscribers
     cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-        "/camera/camera/depth/camera_info", qos, 
+        "/camera/depth/camera_info", qos, 
         std::bind(&PointCloudMapperNodeV5::camera_info_cb, this, _1)
     );
 
     mask_sub_.subscribe(this, dm_topic_, qos.get_rmw_qos_profile());
-    depth_sub_.subscribe(this, "/camera/camera/aligned_depth_to_color/image_raw", qos.get_rmw_qos_profile());
+    depth_sub_.subscribe(this, "/camera/depth", qos.get_rmw_qos_profile());
 
     // 7. Setup Approximate Time Synchronizer (Queue size = 10)
     sync_ = std::make_shared<Sync>(SyncPolicy(10), mask_sub_, depth_sub_);

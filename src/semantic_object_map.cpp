@@ -599,7 +599,8 @@ void SemanticObjectMapV5::add_detections_batch(
     int M = map_ids.size();
     std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, 0.0));
 
-    double w_dist = 1.0, w_iou = 2.0, w_sem = 2.5;
+    // Notice we removed w_dist from here because it is now computed dynamically below
+    double w_sem = 2.0;
     double MAX_COST = 4.0;
 
     for (int i = 0; i < N; ++i) {
@@ -609,18 +610,45 @@ void SemanticObjectMapV5::add_detections_batch(
         for (int j = 0; j < M; ++j) {
             auto& map_obj = objects[map_ids[j]];
 
-            // Distance
+            // 1. Raw Distance
             double dx = det_obb.center[0] - map_obj.pose_map[0];
             double dy = det_obb.center[1] - map_obj.pose_map[1];
             double dz = det_obb.center[2] - map_obj.pose_map[2];
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
             
-            if (dist > 0.9) {
+            // ==========================================
+            // SOTA: SCALE-AWARE DYNAMIC WEIGHTING
+            // ==========================================
+            float max_size_det = std::max({det_obb.extents[0], det_obb.extents[1], det_obb.extents[2]});
+            float max_size_map = std::max({map_obj.obb.extents[0], map_obj.obb.extents[1], map_obj.obb.extents[2]});
+            float max_size = std::max(max_size_det, max_size_map);
+
+            double dynamic_w_dist = 1.0;
+            double dynamic_w_iou = 2.0;
+            if (max_size < 0.2f) {
+                // Small objects: strict distance penalty to keep them distinct
+                dynamic_w_dist = 3.0; 
+                dynamic_w_iou = 2.0;
+            } else if (max_size > 0.7f) {
+                // Large objects: loose distance penalty
+                dynamic_w_dist = 0.4;
+                dynamic_w_iou = 0.5;
+            } else {
+                // Medium objects: linear interpolation
+                double ratio = (max_size - 0.2f) / 0.5f;
+                dynamic_w_dist = 3.0 - (2.6 * ratio);
+                dynamic_w_iou = 2.0 - (1.5 * ratio);
+            }
+
+            // Dynamic Hard Gate: Max allowed shift is 1.5x the object's size (Minimum 40cm)
+            double dynamic_max_dist = std::max(0.4f, max_size * 1.5f);
+            if (dist > dynamic_max_dist) {
                 costMatrix[i][j] = 999.0;
                 continue;
             }
+            // ==========================================
 
-            // Geometric & Semantic
+            // 2. Geometric & Semantic Costs
             double iou = compute_obb_iou(points_cam_list[det_idx], det_obb, map_obj.accumulated_points, map_obj.obb);
             double cost_sem = 1.0;
             if (embeddings_list[det_idx].has_value() && !map_obj.image_embedding.empty()) {
@@ -629,7 +657,8 @@ void SemanticObjectMapV5::add_detections_batch(
 
             double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 5.0 : 0.0;
 
-            costMatrix[i][j] = (w_dist * dist) + (w_iou * (1.0 - iou)) + (w_sem * cost_sem) + class_penalty;
+            // 3. Final Cost Matrix computation
+            costMatrix[i][j] = (dynamic_w_dist * dist) + (dynamic_w_iou * (1.0 - iou)) + (w_sem * cost_sem) + class_penalty;
         }
     }
 

@@ -23,7 +23,7 @@
 #include <tf2_ros/transform_listener.h>
 
 // OpenCV & CV Bridge for Image manipulation
-#include <cv_bridge/cv_bridge.hpp>
+#include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 
 // Message Filters for Exact/Approximate Time Synchronization
