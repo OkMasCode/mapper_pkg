@@ -99,15 +99,22 @@ std::vector<float> SemanticObjectMapV5::fuse_embeddings_running_avg(
     return normalize_embedding(fused);
 }
 
-float SemanticObjectMapV5::compute_semantic_distance(const std::vector<float>& emb1, const std::vector<float>& emb2) {
-    if (emb1.empty() || emb2.empty()) return 1.0f;
+float SemanticObjectMapV5::compute_embedding_similarity(const std::vector<float>& emb1, const std::vector<float>& emb2) {
+    // Compute image-to-image cosine similarity for object correspondence.
+    // Returns raw cosine similarity in [0, 1] where higher = more similar.
+    // Used for matching incoming detections to existing map objects.
+    if (emb1.empty() || emb2.empty()) return 0.0f;
     
     auto e1 = normalize_embedding(emb1);
     auto e2 = normalize_embedding(emb2);
     
-    float sim = std::inner_product(e1.begin(), e1.end(), e2.begin(), 0.0f);
-    sim = std::max(-1.0f, std::min(1.0f, sim)); // Clamp between -1 and 1
-    return 1.0f - sim; // Return distance
+    if (e1.empty() || e2.empty()) return 0.0f;
+    
+    // Cosine similarity of normalized vectors = dot product
+    float cosine_sim = std::inner_product(e1.begin(), e1.end(), e2.begin(), 0.0f);
+    
+    // Clamp to [0, 1]: if vectors point in opposite directions, sim could be negative
+    return std::max(0.0f, std::min(1.0f, cosine_sim));
 }
 
 pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
@@ -558,7 +565,8 @@ void SemanticObjectMapV5::add_detections_batch(
                 float similarity = 0.0f;
                 const auto& map_obj = objects[map_id];
                 if (!image_embedding.empty() && !map_obj.image_embedding.empty()) {
-                    similarity = std::clamp(1.0f - compute_semantic_distance(image_embedding, map_obj.image_embedding), 0.0f, 1.0f);
+                    // Compute image-to-image cosine similarity for object correspondence
+                    similarity = compute_embedding_similarity(image_embedding, map_obj.image_embedding) * 100.0f;
                 }
                 update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding, current_ns, t_id);
                 track_last_seen_ns[t_id] = current_ns;
@@ -629,13 +637,13 @@ void SemanticObjectMapV5::add_detections_batch(
                 // Small objects: strict distance penalty to keep them distinct
                 dynamic_w_dist = 3.0; 
                 dynamic_w_iou = 2.0;
-            } else if (max_size > 0.7f) {
+            } else if (max_size > 1.0f) {
                 // Large objects: loose distance penalty
                 dynamic_w_dist = 0.4;
                 dynamic_w_iou = 0.5;
             } else {
                 // Medium objects: linear interpolation
-                double ratio = (max_size - 0.2f) / 0.5f;
+                double ratio = (max_size - 0.2f) / 0.8f;
                 dynamic_w_dist = 3.0 - (2.6 * ratio);
                 dynamic_w_iou = 2.0 - (1.5 * ratio);
             }
@@ -652,10 +660,13 @@ void SemanticObjectMapV5::add_detections_batch(
             double iou = compute_obb_iou(points_cam_list[det_idx], det_obb, map_obj.accumulated_points, map_obj.obb);
             double cost_sem = 1.0;
             if (embeddings_list[det_idx].has_value() && !map_obj.image_embedding.empty()) {
-                cost_sem = static_cast<double>(compute_semantic_distance(embeddings_list[det_idx].value(), map_obj.image_embedding));
+                // Compute image-to-image cosine similarity: higher = better match = lower cost
+                float similarity = compute_embedding_similarity(embeddings_list[det_idx].value(), map_obj.image_embedding);
+                // Convert similarity [0, 1] to cost: lower similarity = higher cost
+                cost_sem = 1.0 - static_cast<double>(similarity);
             }
 
-            double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 5.0 : 0.0;
+            double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 3.0 : 0.0;
 
             // 3. Final Cost Matrix computation
             costMatrix[i][j] = (dynamic_w_dist * dist) + (dynamic_w_iou * (1.0 - iou)) + (w_sem * cost_sem) + class_penalty;
@@ -678,7 +689,8 @@ void SemanticObjectMapV5::add_detections_batch(
             float similarity = 0.0f;
             const auto& map_obj = objects[m_id];
             if (!image_embedding.empty() && !map_obj.image_embedding.empty()) {
-                similarity = std::clamp(1.0f - compute_semantic_distance(image_embedding, map_obj.image_embedding), 0.0f, 1.0f);
+                // Compute image-to-image cosine similarity for object correspondence
+                similarity = compute_embedding_similarity(image_embedding, map_obj.image_embedding) * 100.0f;
             }
             update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding, current_ns, tracker_ids[det_idx]);
             track_to_map[tracker_ids[det_idx]] = m_id;

@@ -158,9 +158,10 @@ private:
     std::vector<float> fuse_embeddings_running_avg(
         const std::vector<float>& current_embedding, int current_count,
         const std::vector<float>& new_embedding, int new_count);
-        
-    float compute_semantic_distance(
-        const std::vector<float>& emb1, 
+    
+    // Image-to-image cosine similarity for object correspondence
+    float compute_embedding_similarity(
+        const std::vector<float>& emb1,
         const std::vector<float>& emb2);
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr fuse_geometry(
