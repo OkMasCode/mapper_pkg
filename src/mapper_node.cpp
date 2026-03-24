@@ -33,7 +33,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     export_interval_ = this->declare_parameter("export_interval", 3.0);
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
-    viewer_enabled_ = this->declare_parameter("viewer_enabled", false);
+    viewer_enabled_ = this->declare_parameter("viewer_enabled", true);
 
     // Initialize the core Semantic Mapper logic (The Brain)
     semantic_map_ = std::make_unique<SemanticObjectMapV5>();

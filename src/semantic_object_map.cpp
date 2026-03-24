@@ -608,7 +608,7 @@ void SemanticObjectMapV5::add_detections_batch(
     std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, 0.0));
 
     // Notice we removed w_dist from here because it is now computed dynamically below
-    double w_sem = 2.0;
+    double w_sem = 1.5;
     double MAX_COST = 4.0;
 
     for (int i = 0; i < N; ++i) {
@@ -639,17 +639,17 @@ void SemanticObjectMapV5::add_detections_batch(
                 dynamic_w_iou = 2.0;
             } else if (max_size > 1.0f) {
                 // Large objects: loose distance penalty
-                dynamic_w_dist = 0.4;
-                dynamic_w_iou = 0.5;
+                dynamic_w_dist = 0.2;
+                dynamic_w_iou = 0.3;
             } else {
                 // Medium objects: linear interpolation
                 double ratio = (max_size - 0.2f) / 0.8f;
-                dynamic_w_dist = 3.0 - (2.6 * ratio);
-                dynamic_w_iou = 2.0 - (1.5 * ratio);
+                dynamic_w_dist = 3.0 - (2.8 * ratio);
+                dynamic_w_iou = 2.0 - (1.7 * ratio);
             }
 
             // Dynamic Hard Gate: Max allowed shift is 1.5x the object's size (Minimum 40cm)
-            double dynamic_max_dist = std::max(0.4f, max_size * 1.5f);
+            double dynamic_max_dist = std::max(0.4f, max_size * 1.2f);
             if (dist > dynamic_max_dist) {
                 costMatrix[i][j] = 999.0;
                 continue;
