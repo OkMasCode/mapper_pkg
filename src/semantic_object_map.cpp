@@ -128,13 +128,24 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
 
     if (combined->empty()) return combined;
 
-    // Adaptive Voxelization for the merged cloud
+    // Adaptive voxelization with a wider interpolation band so scaling remains active longer.
     int num_combined = combined->points.size();
     float voxel_size = 0.01f;
 
-    if (num_combined < 10000) voxel_size = 0.005f;
-    else if (num_combined > 30000) voxel_size = 0.03f;
-    else voxel_size = 0.005f + (0.02f * ((num_combined - 10000.0f) / 25000.0f));
+    constexpr int kMinCount = 5000;
+    constexpr int kMaxCount = 80000;
+    constexpr float kMinVoxel = 0.004f;
+    constexpr float kMaxVoxel = 0.04f;
+
+    if (num_combined <= kMinCount) {
+        voxel_size = kMinVoxel;
+    } else if (num_combined >= kMaxCount) {
+        voxel_size = kMaxVoxel;
+    } else {
+        const float t = static_cast<float>(num_combined - kMinCount) /
+                        static_cast<float>(kMaxCount - kMinCount);
+        voxel_size = kMinVoxel + ((kMaxVoxel - kMinVoxel) * t);
+    }
     
     // Voxel downsample to merge overlapping points and keep memory clean (7cm)
     pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZ>());
