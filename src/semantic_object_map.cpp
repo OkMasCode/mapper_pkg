@@ -648,13 +648,13 @@ void SemanticObjectMapV5::add_detections_batch(
                 // Small objects: strict distance penalty to keep them distinct
                 dynamic_w_dist = 3.0; 
                 dynamic_w_iou = 2.0;
-            } else if (max_size > 1.0f) {
+            } else if (max_size > 2.0f) {
                 // Large objects: loose distance penalty
                 dynamic_w_dist = 0.2;
                 dynamic_w_iou = 0.3;
             } else {
                 // Medium objects: linear interpolation
-                double ratio = (max_size - 0.2f) / 0.8f;
+                double ratio = (max_size - 0.2f) / 1.8f;
                 dynamic_w_dist = 3.0 - (2.8 * ratio);
                 dynamic_w_iou = 2.0 - (1.7 * ratio);
             }
