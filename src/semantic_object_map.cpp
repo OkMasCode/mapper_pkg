@@ -67,7 +67,7 @@ SemanticObjectMapV5::SemanticObjectMapV5() {
 // 1. GEOMETRY & MATH HELPERS
 // ==========================================
 
-std::vector<float> SemanticObjectMapV5::normalize_embedding(const std::vector<float>& embedding) {
+std::vector<float> SemanticObjectMapV5::normalize_embedding(const std::vector<float>& embedding) const {
     if (embedding.empty()) return {};
     float norm = std::sqrt(std::inner_product(embedding.begin(), embedding.end(), embedding.begin(), 0.0f));
     if (norm <= 1e-12f || !std::isfinite(norm)) return {};
@@ -100,20 +100,11 @@ std::vector<float> SemanticObjectMapV5::fuse_embeddings_running_avg(
 }
 
 float SemanticObjectMapV5::compute_embedding_similarity(const std::vector<float>& emb1, const std::vector<float>& emb2) {
-    // Compute image-to-image cosine similarity for object correspondence.
-    // Returns raw cosine similarity in [0, 1] where higher = more similar.
-    // Used for matching incoming detections to existing map objects.
     if (emb1.empty() || emb2.empty()) return 0.0f;
     
-    auto e1 = normalize_embedding(emb1);
-    auto e2 = normalize_embedding(emb2);
+    // DIRECT DOT PRODUCT: Both vectors are already normalized!
+    float cosine_sim = std::inner_product(emb1.begin(), emb1.end(), emb2.begin(), 0.0f);
     
-    if (e1.empty() || e2.empty()) return 0.0f;
-    
-    // Cosine similarity of normalized vectors = dot product
-    float cosine_sim = std::inner_product(e1.begin(), e1.end(), e2.begin(), 0.0f);
-    
-    // Clamp to [0, 1]: if vectors point in opposite directions, sim could be negative
     return std::max(0.0f, std::min(1.0f, cosine_sim));
 }
 
@@ -749,4 +740,36 @@ void SemanticObjectMapV5::resolve_overlapping_duplicates() {
 
 void SemanticObjectMapV5::export_to_json(const std::string& directory_path, const std::string& file) {
     // As discussed, JSON export is delegated to a separate Python node.
+}
+
+// ---------------------------------------------------------
+// Global Text Query & SigLIP Similarity
+// ---------------------------------------------------------
+
+void SemanticObjectMapV5::set_text_embedding(const std::vector<float>& emb, float scale, float bias) {
+    // Store the global goal
+    goal_text_embedding_ = emb;
+    logit_scale_ = scale;
+    logit_bias_ = bias;
+}
+
+float SemanticObjectMapV5::get_goal_similarity(const std::string& map_id) const {
+    if (goal_text_embedding_.empty()) return 0.0f;
+    
+    auto it = objects.find(map_id);
+    if (it == objects.end()) return 0.0f;
+    
+    const auto& img_emb = it->second.image_embedding;
+    if (img_emb.empty()) return 0.0f;
+
+    // DIRECT DOT PRODUCT: Both vectors are already normalized!
+    float dot_product = std::inner_product(img_emb.begin(), img_emb.end(), goal_text_embedding_.begin(), 0.0f);
+    
+    // Apply SigLIP scale and bias
+    float logits = (dot_product * logit_scale_) + logit_bias_;
+    
+    float clipped_logits = std::clamp(logits, -60.0f, 60.0f);
+    float sigmoid = 1.0f / (1.0f + std::exp(-clipped_logits));
+    
+    return sigmoid * 100.0f;
 }

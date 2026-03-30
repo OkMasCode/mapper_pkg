@@ -17,6 +17,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 
 // TF2 for Coordinate Transformations (Camera -> Map)
 #include <tf2_ros/buffer.h>
@@ -76,6 +77,7 @@ private:
     
     // Grabs the fx, fy, cx, cy lens parameters required for 3D projection
     void camera_info_cb(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
+    void text_embedding_cb(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
 
     // The main loop: Fires when YOLO masks and Depth images arrive together
     void synced_detection_callback(
@@ -137,6 +139,9 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_info_sub_;
     message_filters::Subscriber<yolo11_seg_interfaces::msg::DetectedObjectV3Array> mask_sub_;
     message_filters::Subscriber<sensor_msgs::msg::Image> depth_sub_;
+
+    // Text Embedding and SigLIP State
+    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr text_emb_sub_;
     
     // ROS 2 Synchronizer Definition (Matches masks with depth based on timestamps)
     using SyncPolicy = message_filters::sync_policies::ApproximateTime<

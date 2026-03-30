@@ -142,8 +142,16 @@ public:
 
     std::array<std::array<float, 3>, 8> compute_obb_corners(const OrientedBoundingBox& obb) const;
     
+    void set_text_embedding(const std::vector<float>& emb, float scale, float bias);
+
+    float get_goal_similarity(const std::string& map_id) const;
+
 private:
     int next_map_id_ = 1;
+
+    std::vector<float> goal_text_embedding_;
+    float logit_scale_ = 1.0f;
+    float logit_bias_ = 0.0f;
 
     // --- State Management Helpers ---
     
@@ -153,7 +161,7 @@ private:
 
     // --- Geometry & Math Helpers ---
     
-    std::vector<float> normalize_embedding(const std::vector<float>& embedding);
+    std::vector<float> normalize_embedding(const std::vector<float>& embedding) const;
     
     std::vector<float> fuse_embeddings_running_avg(
         const std::vector<float>& current_embedding, int current_count,

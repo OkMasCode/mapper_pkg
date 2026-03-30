@@ -17,6 +17,7 @@
 #include <Eigen/Geometry>
 #include <pcl/common/transforms.h>
 #include <tf2/exceptions.h>
+#include <std_msgs/msg/float32_multi_array.hpp>
 
 using std::placeholders::_1;
 using std::placeholders::_2;
@@ -69,6 +70,11 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
         std::bind(&PointCloudMapperNodeV5::camera_info_cb, this, _1)
     ); 
 
+    text_emb_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
+        "/vision/text_embedding", 10,
+        std::bind(&PointCloudMapperNodeV5::text_embedding_cb, this, _1)
+    );
+
     mask_sub_.subscribe(this, dm_topic_, qos.get_rmw_qos_profile());
     depth_sub_.subscribe(this, "/camera/depth", qos.get_rmw_qos_profile()); // /camera/camera/aligned_depth_to_color/image_raw
 
@@ -90,6 +96,9 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
 }
 
 void PointCloudMapperNodeV5::camera_info_cb(const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
     if (!intrinsics_ready_) {
         fx_ = msg->k[0];
         cx_ = msg->k[2];
@@ -97,6 +106,23 @@ void PointCloudMapperNodeV5::camera_info_cb(const sensor_msgs::msg::CameraInfo::
         cy_ = msg->k[5];
         intrinsics_ready_ = true;
         RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:camera_info] received intrinsics fx=%.3f fy=%.3f cx=%.3f cy=%.3f", fx_, fy_, cx_, cy_);
+    }
+}
+
+void PointCloudMapperNodeV5::text_embedding_cb(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
+    // Lock the mutex to ensure thread safety with the map publisher
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // We expect the embedding + 2 extra values (scale and bias) at the end
+    if (msg->data.size() > 2) {
+        float bias = msg->data.back();
+        float scale = msg->data[msg->data.size() - 2];
+        
+        // Extract the actual embedding vector
+        std::vector<float> emb(msg->data.begin(), msg->data.end() - 2);
+        
+        // Pass the updated global goal to the map logic
+        semantic_map_->set_text_embedding(emb, scale, bias);
     }
 }
 
@@ -140,14 +166,13 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         "[mapper_node_v5:sync] callback active. detections=%zu depth_encoding=%s",
         mask_msg->detections.size(), depth_msg->encoding.c_str());
 
+    std::lock_guard<std::mutex> lock(mutex_);
+
     if (!intrinsics_ready_) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
             "[mapper_node_v5:sync] skipping frame because camera intrinsics are not ready");
         return;
     }
-
-    // Lock the mutex to ensure thread safety during map updates
-    std::lock_guard<std::mutex> lock(mutex_);
 
     // 1. Convert ROS Depth Image to OpenCV float32 matrix (meters)
     auto t_depth_start = std::chrono::steady_clock::now();
@@ -277,10 +302,10 @@ void PointCloudMapperNodeV5::synced_detection_callback(
                     clean_cloud->points.push_back(downsampled_cloud->points[idx]);
                 }
             } else {
-                clean_cloud = downsampled_cloud;
+                *clean_cloud = *downsampled_cloud;
             }
         } else {
-            clean_cloud = downsampled_cloud;
+            *clean_cloud = *downsampled_cloud;
         }
         clean_cloud->width = clean_cloud->points.size();
         clean_cloud->height = 1;
@@ -435,10 +460,9 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
         }
         
         obj_msg.occurrences = entry.occurrences;
-        obj_msg.similarity = entry.similarity;
         obj_msg.confidence = entry.confidence_ema;
         obj_msg.image_embedding = entry.image_embedding;
-
+        obj_msg.similarity = semantic_map_->get_goal_similarity(map_id);
         msg.objects.push_back(obj_msg);
     }
 
