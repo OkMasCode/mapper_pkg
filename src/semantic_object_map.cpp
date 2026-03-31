@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <optional>
 #include <array>
+#include <set>
 
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
@@ -756,12 +757,115 @@ void SemanticObjectMapV5::fuse_objects(const std::string& keep_id, const std::st
 }
 
 void SemanticObjectMapV5::resolve_overlapping_duplicates() {
-    // Boilerplate for map merging
-    std::cout << "[SemanticObjectMap] Overlap resolution complete.\n";
+    if (objects.size() < 2) return;
+
+    // Store all IDs in a standard vector to safely iterate without invalidating iterators
+    std::vector<std::string> ids;
+    for (const auto& pair : objects) {
+        ids.push_back(pair.first);
+    }
+
+    // Use a set to keep track of objects that have been merged and should be ignored
+    std::set<std::string> to_remove;
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const std::string& id_a = ids[i];
+        if (to_remove.count(id_a)) continue;
+
+        for (size_t j = i + 1; j < ids.size(); ++j) {
+            const std::string& id_b = ids[j];
+            if (to_remove.count(id_b)) continue;
+
+            auto& obj_a = objects[id_a];
+            auto& obj_b = objects[id_b];
+
+            // STRICT CONDITION 1: Only proceed if both objects share the exact same class name
+            if (obj_a.current_name != obj_b.current_name) {
+                continue;
+            }
+
+            // Calculate the spatial overlap using your existing orientation-aware proxy
+            float iou = oriented_overlap_ratio(
+                obj_a.accumulated_points, obj_a.obb,
+                obj_b.accumulated_points, obj_b.obb
+            );
+
+            // STRICT CONDITION 2: Require a very high overlap (e.g., 80%) to trigger a merge
+            if (iou > 0.80f) {
+                // Keep the object that has a higher history of occurrences
+                std::string keep_id, drop_id;
+                if (obj_a.occurrences >= obj_b.occurrences) {
+                    keep_id = id_a;
+                    drop_id = id_b;
+                } else {
+                    keep_id = id_b;
+                    drop_id = id_a;
+                }
+
+                std::cout << "[SemanticObjectMap] Merging duplicate " << drop_id 
+                          << " into " << keep_id << " (Class: " << obj_a.current_name 
+                          << ", IoU: " << iou << ")\n";
+
+                // Fuse the geometries and map properties
+                fuse_objects(keep_id, drop_id);
+                
+                // Mark the dropped ID so it is skipped in future iterations
+                to_remove.insert(drop_id);
+
+                // If the object from the outer loop was dropped, stop comparing it against others
+                if (drop_id == id_a) {
+                    break;
+                }
+            }
+        }
+    }
+    
+    std::cout << "[SemanticObjectMap] Overlap resolution complete. Removed " 
+              << to_remove.size() << " strict duplicates.\n";
 }
 
-void SemanticObjectMapV5::export_to_json(const std::string& directory_path, const std::string& file) {
-    // As discussed, JSON export is delegated to a separate Python node.
+void SemanticObjectMapV5::remove_wrong_detections() {
+    if (objects.empty()) return;
+
+    // 1. Find the latest timestamp in the map to represent the "current time".
+    // This avoids needing to pass a ROS clock or external time parameter.
+    long long current_ns = 0;
+    for (const auto& pair : objects) {
+        current_ns = std::max(current_ns, pair.second.last_seen_ns);
+    }
+
+    // 2. Define thresholds locally (you can move these to your .hpp file later if needed)
+    constexpr double kMaxAgeSec = 10.0;     // Object must be older than 10 seconds
+    constexpr int kMinOccurrences = 5;      // Object must have fewer than 5 occurrences
+
+    int removed_count = 0;
+
+    // 3. Safely iterate through the map and erase invalid objects
+    for (auto it = objects.begin(); it != objects.end(); ) {
+        
+        // Calculate the age of the object in seconds
+        double age_sec = static_cast<double>(current_ns - it->second.first_seen_ns) / 1e9;
+
+        // Condition: Older than the time threshold AND fewer occurrences than the threshold
+        if (age_sec > kMaxAgeSec && it->second.occurrences < kMinOccurrences) {
+            
+            std::cout << "[SemanticObjectMap] Removing wrong detection: " << it->first 
+                      << " (Class: " << it->second.current_name 
+                      << ", Age: " << age_sec << "s, Occurrences: " << it->second.occurrences << ")\n";
+            
+            // erase() removes the element and safely returns an iterator to the next element
+            it = objects.erase(it);
+            removed_count++;
+            
+        } else {
+            // Move to the next element only if we didn't erase the current one
+            ++it;
+        }
+    }
+
+    if (removed_count > 0) {
+        std::cout << "[SemanticObjectMap] Removed " << removed_count << " wrong detections.\n";
+    }
 }
 
 // ---------------------------------------------------------

@@ -138,9 +138,9 @@ public:
         const std::string& map_frame);
 
     void resolve_overlapping_duplicates();
-    
-    void export_to_json(const std::string& directory_path, const std::string& file);
 
+    void remove_wrong_detections();
+    
     void refine_object_geometry(const std::string& map_id);
 
     std::array<std::array<float, 3>, 8> compute_obb_corners(const OrientedBoundingBox& obb) const;

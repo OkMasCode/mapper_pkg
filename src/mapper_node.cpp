@@ -544,10 +544,8 @@ void PointCloudMapperNodeV5::export_callback() {
         }
         // Run the geometric duplicate cleanup routine
         semantic_map_->resolve_overlapping_duplicates();
-        
-        // Export to JSON (Handled internally by the Mapper or bypassed if separated to Python)
-        semantic_map_->export_to_json(output_dir_, output_map_file_);
-        
+        semantic_map_->remove_wrong_detections();
+    
         publish_semantic_map();
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "Export/Merge error: %s", e.what());
@@ -558,7 +556,6 @@ void PointCloudMapperNodeV5::shutdown_callback() {
     std::lock_guard<std::mutex> lock(mutex_);
     try {
         RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:shutdown] exporting final map");
-        semantic_map_->export_to_json(output_dir_, "map_v5_final.json");
         RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:shutdown] final export complete");
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "[mapper_node_v5] final export error: %s", e.what());
