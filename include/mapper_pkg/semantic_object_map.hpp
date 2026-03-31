@@ -57,7 +57,8 @@ struct MapObject {
     // Embeddings & Confidence
     float similarity = 0.0f;
     float confidence_ema = 0.0f;
-    std::vector<float> image_embedding;
+    std::vector<float> image_embedding_masked;
+    std::vector<float> image_embedding_unmasked;
     float embedding_confidence_max = -1.0f;
     std::string source_track_id;
 
@@ -83,7 +84,8 @@ struct TentativeTrack {
     std::string class_name;
     float confidence_max = 0.0f;
     float confidence_sum = 0.0f;
-    std::vector<float> image_embedding;
+    std::vector<float> image_embedding_masked;
+    std::vector<float> image_embedding_unmasked;
     float embedding_confidence_max = -1.0f;
 };
 
@@ -129,7 +131,8 @@ public:
         const std::vector<std::string>& tracker_ids,
         const std::vector<float>& confidences,
         const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list,
-        const std::vector<std::optional<std::vector<float>>>& embeddings_list,
+        const std::vector<std::optional<std::vector<float>>>& embeddings_list_masked,
+        const std::vector<std::optional<std::vector<float>>>& embeddings_list_unmasked,
         const builtin_interfaces::msg::Time& stamp,
         const std::string& camera_frame,
         const std::string& map_frame);
@@ -195,7 +198,8 @@ private:
         pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
         const builtin_interfaces::msg::Time& detection_stamp,
         float confidence,
-        const std::vector<float>& image_embedding,
+        const std::vector<float>& image_embedding_masked,
+        const std::vector<float>& image_embedding_unmasked,
         long long current_ns,
         const std::string& frame);
 
@@ -206,7 +210,8 @@ private:
         pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
         float similarity,
         float confidence,
-        const std::vector<float>& image_embedding,
+        const std::vector<float>& image_embedding_masked,
+        const std::vector<float>& image_embedding_unmasked,
         long long current_ns,
         const std::string& source_track_id);
 

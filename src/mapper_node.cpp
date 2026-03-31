@@ -229,7 +229,8 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     std::vector<std::string> tracker_ids;
     std::vector<float> confidences;
     std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> points_cam_list;
-    std::vector<std::optional<std::vector<float>>> embeddings_list;
+    std::vector<std::optional<std::vector<float>>> embeddings_list_masked;
+    std::vector<std::optional<std::vector<float>>> embeddings_list_unmasked;
 
     int accepted_detections = 0;
 
@@ -339,10 +340,15 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         tracker_ids.push_back(std::to_string(det.instance_id));
         confidences.push_back(det.confidence);
         points_cam_list.push_back(cloud_map);
-        if (!det.embedding.empty()) {
-            embeddings_list.emplace_back(det.embedding);
+        if (!det.image_embedding_masked.empty()) {
+            embeddings_list_masked.emplace_back(det.image_embedding_masked);
         } else {
-            embeddings_list.emplace_back(std::nullopt);
+            embeddings_list_masked.emplace_back(std::nullopt);
+        }
+        if (!det.image_embedding_unmasked.empty()) {
+            embeddings_list_unmasked.emplace_back(det.image_embedding_unmasked);
+        } else {
+            embeddings_list_unmasked.emplace_back(std::nullopt);
         }
         accepted_detections++;
     }
@@ -355,7 +361,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     if (!points_cam_list.empty()) {
         auto t_batch_start = std::chrono::steady_clock::now();
         semantic_map_->add_detections_batch(
-            object_names, tracker_ids, confidences, points_cam_list, embeddings_list,
+            object_names, tracker_ids, confidences, points_cam_list, embeddings_list_masked, embeddings_list_unmasked,
             mask_msg->header.stamp, camera_frame_, map_frame_
         );
         auto t_batch_end = std::chrono::steady_clock::now();
@@ -461,7 +467,8 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
         
         obj_msg.occurrences = entry.occurrences;
         obj_msg.confidence = entry.confidence_ema;
-        obj_msg.image_embedding = entry.image_embedding;
+        obj_msg.image_embedding_masked = entry.image_embedding_masked;
+        obj_msg.image_embedding_unmasked = entry.image_embedding_unmasked;
         obj_msg.similarity = semantic_map_->get_goal_similarity(map_id);
         msg.objects.push_back(obj_msg);
     }

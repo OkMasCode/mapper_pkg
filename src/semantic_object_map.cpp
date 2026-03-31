@@ -372,7 +372,8 @@ void SemanticObjectMapV5::update_object(
     const builtin_interfaces::msg::Time& detection_stamp,
     pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
     float similarity, float confidence,
-    const std::vector<float>& image_embedding,
+    const std::vector<float>& image_embedding_masked,
+    const std::vector<float>& image_embedding_unmasked,
     long long current_ns, const std::string& source_track_id) 
 {
     auto& entry = objects[map_id];
@@ -388,9 +389,13 @@ void SemanticObjectMapV5::update_object(
     entry.current_name = choose_consensus_class(entry.class_counts, entry.class_conf_sums, entry.current_name);
     entry.confidence_ema = ((1.0f - confidence_ema_alpha) * entry.confidence_ema) + (confidence_ema_alpha * confidence);
 
-    if (!image_embedding.empty()) {
-        entry.image_embedding = fuse_embeddings_running_avg(entry.image_embedding, entry.occurrences, image_embedding, 1);
+    if (!image_embedding_masked.empty()) {
+        entry.image_embedding_masked = fuse_embeddings_running_avg(entry.image_embedding_masked, entry.occurrences, image_embedding_masked, 1);
         entry.embedding_confidence_max = std::max(entry.embedding_confidence_max, confidence);
+    }
+
+    if (!image_embedding_unmasked.empty()) {
+        entry.image_embedding_unmasked = fuse_embeddings_running_avg(entry.image_embedding_unmasked, entry.occurrences, image_embedding_unmasked, 1);
     }
 
     entry.similarity = std::isfinite(similarity) ? similarity : 0.0f;
@@ -415,7 +420,8 @@ bool SemanticObjectMapV5::update_tentative(
     pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
     const builtin_interfaces::msg::Time& detection_stamp,
     float confidence,
-    const std::vector<float>& image_embedding,
+    const std::vector<float>& image_embedding_masked,
+    const std::vector<float>& image_embedding_unmasked,
     long long current_ns,
     const std::string& frame)
 {
@@ -443,9 +449,12 @@ bool SemanticObjectMapV5::update_tentative(
         t.class_name = object_name;
         t.confidence_max = confidence;
         t.confidence_sum = confidence;
-        if (!image_embedding.empty()) {
-            t.image_embedding = normalize_embedding(image_embedding);
+        if (!image_embedding_masked.empty()) {
+            t.image_embedding_masked = normalize_embedding(image_embedding_masked);
             t.embedding_confidence_max = confidence;
+        }
+        if (!image_embedding_unmasked.empty()) {
+            t.image_embedding_unmasked = normalize_embedding(image_embedding_unmasked);
         }
         tentative_tracks[tracker_id] = t;
 
@@ -461,9 +470,12 @@ bool SemanticObjectMapV5::update_tentative(
     t.timestamp = detection_stamp;
     t.confidence_sum += confidence;
     t.confidence_max = std::max(t.confidence_max, confidence);
-    if (!image_embedding.empty()) {
+    if (!image_embedding_masked.empty()) {
         t.embedding_confidence_max = std::max(t.embedding_confidence_max, confidence);
-        t.image_embedding = fuse_embeddings_running_avg(t.image_embedding, t.hits - 1, image_embedding, 1);
+        t.image_embedding_masked = fuse_embeddings_running_avg(t.image_embedding_masked, t.hits - 1, image_embedding_masked, 1);
+    }
+    if (!image_embedding_unmasked.empty()) {
+        t.image_embedding_unmasked = fuse_embeddings_running_avg(t.image_embedding_unmasked, t.hits - 1, image_embedding_unmasked, 1);
     }
 
     if (confidence >= t.confidence_max || t.class_name.empty()) {
@@ -495,7 +507,8 @@ bool SemanticObjectMapV5::update_tentative(
     obj.first_seen_ns = current_ns;
     obj.last_seen_ns = current_ns;
     obj.current_name = t.class_name.empty() ? object_name : t.class_name;
-    obj.image_embedding = t.image_embedding;
+    obj.image_embedding_masked = t.image_embedding_masked;
+    obj.image_embedding_unmasked = t.image_embedding_unmasked;
     obj.embedding_confidence_max = t.embedding_confidence_max;
     obj.source_track_id = tracker_id;
     objects[map_id] = obj;
@@ -507,7 +520,8 @@ bool SemanticObjectMapV5::update_tentative(
         t.accumulated_points,
         0.0f,
         static_cast<float>(avg_conf),
-        t.image_embedding,
+        t.image_embedding_masked,
+        t.image_embedding_unmasked,
         current_ns,
         tracker_id);
 
@@ -530,7 +544,8 @@ void SemanticObjectMapV5::add_detections_batch(
     const std::vector<std::string>& tracker_ids,
     const std::vector<float>& confidences,
     const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list,
-    const std::vector<std::optional<std::vector<float>>>& embeddings_list,
+    const std::vector<std::optional<std::vector<float>>>& embeddings_list_masked,
+    const std::vector<std::optional<std::vector<float>>>& embeddings_list_unmasked,
     const builtin_interfaces::msg::Time& stamp,
     const std::string& camera_frame,
     const std::string& map_frame)
@@ -540,10 +555,11 @@ void SemanticObjectMapV5::add_detections_batch(
     if (object_names.size() != points_cam_list.size() ||
         tracker_ids.size() != points_cam_list.size() ||
         confidences.size() != points_cam_list.size() ||
-        embeddings_list.size() != points_cam_list.size()) {
+        embeddings_list_masked.size() != points_cam_list.size() ||
+        embeddings_list_unmasked.size() != points_cam_list.size()) {
         std::cout << "[SemanticObjectMap] batch skip: size mismatch names=" << object_names.size()
                   << " tracks=" << tracker_ids.size() << " conf=" << confidences.size()
-                  << " points=" << points_cam_list.size() << " embeddings=" << embeddings_list.size() << "\n";
+                  << " points=" << points_cam_list.size() << " embeddings=" << embeddings_list_masked.size() << "\n";
         return;
     }
 
@@ -563,14 +579,15 @@ void SemanticObjectMapV5::add_detections_batch(
             
             // Safety Gate: Do not trust tracker if class suddenly flips
             if (object_names[i] == objects[map_id].current_name) {
-                const std::vector<float> image_embedding = embeddings_list[i].has_value() ? embeddings_list[i].value() : std::vector<float>{};
+                const std::vector<float> image_embedding_masked = embeddings_list_masked[i].has_value() ? embeddings_list_masked[i].value() : std::vector<float>{};
+                const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[i].has_value() ? embeddings_list_unmasked[i].value() : std::vector<float>{};
                 float similarity = 0.0f;
                 const auto& map_obj = objects[map_id];
-                if (!image_embedding.empty() && !map_obj.image_embedding.empty()) {
+                if (!image_embedding_masked.empty() && !map_obj.image_embedding_masked.empty()) {
                     // Compute image-to-image cosine similarity for object correspondence
-                    similarity = compute_embedding_similarity(image_embedding, map_obj.image_embedding) * 100.0f;
+                    similarity = compute_embedding_similarity(image_embedding_masked, map_obj.image_embedding_masked) * 100.0f;
                 }
-                update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding, current_ns, t_id);
+                update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding_masked, image_embedding_unmasked, current_ns, t_id);
                 track_last_seen_ns[t_id] = current_ns;
                 matched = true;
             }
@@ -591,14 +608,16 @@ void SemanticObjectMapV5::add_detections_batch(
         std::cout << "[SemanticObjectMap] map empty: routing " << unmatched_indices.size()
                   << " detections to tentative tracks\n";
         for (int det_idx : unmatched_indices) {
-            const std::vector<float> image_embedding = embeddings_list[det_idx].has_value() ? embeddings_list[det_idx].value() : std::vector<float>{};
+            const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
+            const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
                 points_cam_list[det_idx],
                 stamp,
                 confidences[det_idx],
-                image_embedding,
+                image_embedding_masked,
+                image_embedding_unmasked,
                 current_ns,
                 map_frame.empty() ? camera_frame : map_frame);
         }
@@ -661,9 +680,9 @@ void SemanticObjectMapV5::add_detections_batch(
             // 2. Geometric & Semantic Costs
             double iou = compute_obb_iou(points_cam_list[det_idx], det_obb, map_obj.accumulated_points, map_obj.obb);
             double cost_sem = 1.0;
-            if (embeddings_list[det_idx].has_value() && !map_obj.image_embedding.empty()) {
+            if (embeddings_list_masked[det_idx].has_value() && !map_obj.image_embedding_masked.empty()) {
                 // Compute image-to-image cosine similarity: higher = better match = lower cost
-                float similarity = compute_embedding_similarity(embeddings_list[det_idx].value(), map_obj.image_embedding);
+                float similarity = compute_embedding_similarity(embeddings_list_masked[det_idx].value(), map_obj.image_embedding_masked);
                 // Convert similarity [0, 1] to cost: lower similarity = higher cost
                 cost_sem = 1.0 - static_cast<double>(similarity);
             }
@@ -687,26 +706,29 @@ void SemanticObjectMapV5::add_detections_batch(
         // If matched and the cost is under the maximum threshold
         if (map_idx >= 0 && costMatrix[i][map_idx] < MAX_COST) {
             std::string m_id = map_ids[map_idx];
-            const std::vector<float> image_embedding = embeddings_list[det_idx].has_value() ? embeddings_list[det_idx].value() : std::vector<float>{};
+            const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
+            const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
             float similarity = 0.0f;
             const auto& map_obj = objects[m_id];
-            if (!image_embedding.empty() && !map_obj.image_embedding.empty()) {
+            if (!image_embedding_masked.empty() && !map_obj.image_embedding_masked.empty()) {
                 // Compute image-to-image cosine similarity for object correspondence
-                similarity = compute_embedding_similarity(image_embedding, map_obj.image_embedding) * 100.0f;
+                similarity = compute_embedding_similarity(image_embedding_masked, map_obj.image_embedding_masked) * 100.0f;
             }
-            update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding, current_ns, tracker_ids[det_idx]);
+            update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding_masked, image_embedding_unmasked, current_ns, tracker_ids[det_idx]);
             track_to_map[tracker_ids[det_idx]] = m_id;
             track_last_seen_ns[tracker_ids[det_idx]] = current_ns;
         } else {
             // PHASE 3: Spawn New Tentative Tracks
-            const std::vector<float> image_embedding = embeddings_list[det_idx].has_value() ? embeddings_list[det_idx].value() : std::vector<float>{};
+            const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
+            const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
                 points_cam_list[det_idx],
                 stamp,
                 confidences[det_idx],
-                image_embedding,
+                image_embedding_masked,
+                image_embedding_unmasked,
                 current_ns,
                 map_frame.empty() ? camera_frame : map_frame);
         }
@@ -759,17 +781,27 @@ float SemanticObjectMapV5::get_goal_similarity(const std::string& map_id) const 
     auto it = objects.find(map_id);
     if (it == objects.end()) return 0.0f;
     
-    const auto& img_emb = it->second.image_embedding;
-    if (img_emb.empty()) return 0.0f;
+    const auto& img_emb_masked = it->second.image_embedding_masked;
+    const auto& img_emb_unmasked = it->second.image_embedding_unmasked;
 
-    // DIRECT DOT PRODUCT: Both vectors are already normalized!
-    float dot_product = std::inner_product(img_emb.begin(), img_emb.end(), goal_text_embedding_.begin(), 0.0f);
-    
-    // Apply SigLIP scale and bias
-    float logits = (dot_product * logit_scale_) + logit_bias_;
-    
-    float clipped_logits = std::clamp(logits, -60.0f, 60.0f);
-    float sigmoid = 1.0f / (1.0f + std::exp(-clipped_logits));
-    
-    return sigmoid * 100.0f;
+    // 1. Compute Masked Score
+    float score_masked = 0.0f;
+    if (!img_emb_masked.empty()) {
+        float dot_m = std::inner_product(img_emb_masked.begin(), img_emb_masked.end(), goal_text_embedding_.begin(), 0.0f);
+        float logits_m = (dot_m * logit_scale_) + logit_bias_;
+        float clipped_m = std::clamp(logits_m, -60.0f, 60.0f);
+        score_masked = (1.0f / (1.0f + std::exp(-clipped_m))) * 100.0f;
+    }
+
+    // 2. Compute Unmasked Score
+    float score_unmasked = 0.0f;
+    if (!img_emb_unmasked.empty()) {
+        float dot_u = std::inner_product(img_emb_unmasked.begin(), img_emb_unmasked.end(), goal_text_embedding_.begin(), 0.0f);
+        float logits_u = (dot_u * logit_scale_) + logit_bias_;
+        float clipped_u = std::clamp(logits_u, -60.0f, 60.0f);
+        score_unmasked = (1.0f / (1.0f + std::exp(-clipped_u))) * 100.0f;
+    }
+
+    // 3. Blend exactly like the Python vision node (85% masked / 15% unmasked)
+    return (1.0f * score_masked) + (0.0f * score_unmasked);
 }
