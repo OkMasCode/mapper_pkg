@@ -650,10 +650,16 @@ void SemanticObjectMapV5::add_detections_batch(
     // Notice we removed w_dist from here because it is now computed dynamically below
     double w_sem = 1.5;
     double MAX_COST = 4.0;
+    constexpr double kBlockedCost = 999.0;
+    constexpr int kTopKPerDetection = 3;
 
     for (int i = 0; i < N; ++i) {
         int det_idx = unmatched_indices[i];
         OrientedBoundingBox det_obb = compute_obb(points_cam_list[det_idx]);
+
+        // Stage 1: Cheap preselection (distance + class), no IoU/embedding yet.
+        std::vector<std::pair<double, int>> cheap_candidates;
+        cheap_candidates.reserve(M);
 
         for (int j = 0; j < M; ++j) {
             auto& map_obj = objects[map_ids[j]];
@@ -691,10 +697,63 @@ void SemanticObjectMapV5::add_detections_batch(
             // Dynamic Hard Gate: Max allowed shift is 1.5x the object's size (Minimum 40cm)
             double dynamic_max_dist = std::max(0.4f, max_size * 1.2f);
             if (dist > dynamic_max_dist) {
-                costMatrix[i][j] = 999.0;
+                costMatrix[i][j] = kBlockedCost;
                 continue;
             }
             // ==========================================
+
+            double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 3.0 : 0.0;
+            const double cheap_cost = (dynamic_w_dist * dist) + class_penalty;
+            cheap_candidates.push_back({cheap_cost, j});
+            costMatrix[i][j] = kBlockedCost;
+        }
+
+        if (cheap_candidates.empty()) {
+            continue;
+        }
+
+        // Keep only top-K candidates per detection for expensive scoring.
+        const int keep = std::min<int>(kTopKPerDetection, static_cast<int>(cheap_candidates.size()));
+        if (keep < static_cast<int>(cheap_candidates.size())) {
+            std::nth_element(
+                cheap_candidates.begin(),
+                cheap_candidates.begin() + keep,
+                cheap_candidates.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+        } else {
+            std::sort(
+                cheap_candidates.begin(),
+                cheap_candidates.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+
+        for (int c = 0; c < keep; ++c) {
+            const int j = cheap_candidates[c].second;
+            auto& map_obj = objects[map_ids[j]];
+
+            // Recompute raw distance terms for final cost on shortlisted pairs.
+            double dx = det_obb.center[0] - map_obj.pose_map[0];
+            double dy = det_obb.center[1] - map_obj.pose_map[1];
+            double dz = det_obb.center[2] - map_obj.pose_map[2];
+            double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+            float max_size_det = std::max({det_obb.extents[0], det_obb.extents[1], det_obb.extents[2]});
+            float max_size_map = std::max({map_obj.obb.extents[0], map_obj.obb.extents[1], map_obj.obb.extents[2]});
+            float max_size = std::max(max_size_det, max_size_map);
+
+            double dynamic_w_dist = 1.0;
+            double dynamic_w_iou = 2.0;
+            if (max_size < 0.2f) {
+                dynamic_w_dist = 3.0;
+                dynamic_w_iou = 2.0;
+            } else if (max_size > 2.0f) {
+                dynamic_w_dist = 0.2;
+                dynamic_w_iou = 0.3;
+            } else {
+                double ratio = (max_size - 0.2f) / 1.8f;
+                dynamic_w_dist = 3.0 - (2.8 * ratio);
+                dynamic_w_iou = 2.0 - (1.7 * ratio);
+            }
 
             // 2. Geometric & Semantic Costs
             double iou = compute_obb_iou(points_cam_list[det_idx], det_obb, map_obj.accumulated_points, map_obj.obb);
