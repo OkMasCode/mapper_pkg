@@ -250,7 +250,7 @@ float SemanticObjectMapV5::oriented_overlap_ratio(
 
     // SOTA Optimization: Uniformly sample max 100 points per cloud for IoU evaluation.
     // This reduces point-in-OBB matrix operations from ~10,000 to 100 per check.
-    const size_t max_eval_points = 100;
+    const size_t max_eval_points = 50;
     
     size_t step1 = std::max<size_t>(1, points1->points.size() / max_eval_points);
     int in_1_in_2 = 0;

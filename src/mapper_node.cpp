@@ -176,6 +176,8 @@ void PointCloudMapperNodeV5::synced_detection_callback(
 
     std::lock_guard<std::mutex> lock(mutex_);
 
+    detections_seen_total_ += static_cast<int>(mask_msg->detections.size());
+
     if (!intrinsics_ready_) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
             "[mapper_node_v5:sync] skipping frame because camera intrinsics are not ready");
@@ -387,6 +389,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "[mapper_node_v5:sync] accepted_detections=%d raw_detections=%zu src_frame=%s map_frame=%s",
         accepted_detections, mask_msg->detections.size(), source_frame.c_str(), map_frame_.c_str());
+    detections_accepted_total_ += accepted_detections;
 
     // 3. Pass the batch to the Semantic Mapper Logic (The Bipartite Matrix)
     if (!points_cam_list.empty()) {
@@ -595,57 +598,98 @@ void PointCloudMapperNodeV5::shutdown_callback() {
 
 void PointCloudMapperNodeV5::print_timing_stats() {
     if (frame_count_ == 0) return;
+
+    struct StepRow {
+        const char* name;
+        const TimingStats& stats;
+    };
+
+    const std::array<StepRow, 6> rows = {{
+        {"Depth Conversion", timing_depth_conversion_},
+        {"Point Extraction", timing_point_extraction_},
+        {"Filtering (Voxel+Cluster)", timing_filtering_},
+        {"Transform to Map", timing_transformation_},
+        {"Batch Addition (Matching)", timing_batch_addition_},
+        {"Publishing", timing_publishing_}
+    }};
+
+    const double total_window_ms = timing_total_.total_time_ms;
+    const double avg_total_frame_ms = timing_total_.average();
+    const double fps = avg_total_frame_ms > 1e-6 ? (1000.0 / avg_total_frame_ms) : 0.0;
     
     // Print header
-    std::cout << "\n" << std::string(75, '=') << "\n";
+    std::cout << "\n" << std::string(118, '=') << "\n";
     std::cout << "TIMING STATISTICS (30-second window, " << frame_count_ << " frames)\n";
-    std::cout << std::string(75, '=') << "\n";
-    std::cout << std::left 
-              << std::setw(30) << "Step" 
-              << std::setw(20) << "Avg Time (ms)" 
-              << std::setw(15) << "Frames" 
+    std::cout << "Total avg frame time: " << std::fixed << std::setprecision(3) << avg_total_frame_ms
+              << " ms  |  Effective FPS: " << fps << "\n";
+    std::cout << "Detections seen: " << detections_seen_total_
+              << "  accepted: " << detections_accepted_total_;
+    if (detections_seen_total_ > 0) {
+        const double accept_rate = 100.0 * static_cast<double>(detections_accepted_total_) /
+                                   static_cast<double>(detections_seen_total_);
+        std::cout << "  (accept rate: " << accept_rate << "%)";
+    }
+    std::cout << "\n";
+    std::cout << std::string(118, '=') << "\n";
+    std::cout << std::left
+              << std::setw(30) << "Step"
+              << std::setw(14) << "Calls"
+              << std::setw(13) << "Calls/Frame"
+              << std::setw(16) << "Avg/Call (ms)"
+              << std::setw(16) << "Total (ms)"
+              << std::setw(16) << "Avg/Frame (ms)"
+              << std::setw(11) << "%Total"
               << "\n";
-    std::cout << std::string(75, '-') << "\n";
+    std::cout << std::string(118, '-') << "\n";
     
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << std::left 
-              << std::setw(30) << "Depth Conversion"
-              << std::setw(20) << timing_depth_conversion_.average()
-              << std::setw(15) << timing_depth_conversion_.count << "\n";
-    
-    std::cout << std::left 
-              << std::setw(30) << "Point Extraction"
-              << std::setw(20) << timing_point_extraction_.average()
-              << std::setw(15) << timing_point_extraction_.count << "\n";
-    
-    std::cout << std::left 
-              << std::setw(30) << "Filtering (Voxel+SOR)"
-              << std::setw(20) << timing_filtering_.average()
-              << std::setw(15) << timing_filtering_.count << "\n";
-    
-    std::cout << std::left 
-              << std::setw(30) << "Transform to Map"
-              << std::setw(20) << timing_transformation_.average()
-              << std::setw(15) << timing_transformation_.count << "\n";
-    
-    std::cout << std::left 
-              << std::setw(30) << "Batch Addition (Matching)"
-              << std::setw(20) << timing_batch_addition_.average()
-              << std::setw(15) << timing_batch_addition_.count << "\n";
-    
-    std::cout << std::left 
-              << std::setw(30) << "Publishing"
-              << std::setw(20) << timing_publishing_.average()
-              << std::setw(15) << timing_publishing_.count << "\n";
-    
-    std::cout << std::string(75, '-') << "\n";
-    
-    std::cout << std::left 
-              << std::setw(30) << "TOTAL"
-              << std::setw(20) << timing_total_.average()
-              << std::setw(15) << timing_total_.count << "\n";
-    
-    std::cout << std::string(75, '=') << "\n\n";
+
+    double step_total_sum_ms = 0.0;
+    for (const auto& row : rows) {
+        const double calls_per_frame = static_cast<double>(row.stats.count) / static_cast<double>(frame_count_);
+        const double avg_call_ms = row.stats.average();
+        const double avg_frame_ms = row.stats.total_time_ms / static_cast<double>(frame_count_);
+        const double pct_total = total_window_ms > 1e-6 ? (100.0 * row.stats.total_time_ms / total_window_ms) : 0.0;
+        step_total_sum_ms += row.stats.total_time_ms;
+
+        std::cout << std::left
+                  << std::setw(30) << row.name
+                  << std::setw(14) << row.stats.count
+                  << std::setw(13) << calls_per_frame
+                  << std::setw(16) << avg_call_ms
+                  << std::setw(16) << row.stats.total_time_ms
+                  << std::setw(16) << avg_frame_ms
+                  << std::setw(11) << pct_total
+                  << "\n";
+    }
+
+    const double unaccounted_ms = std::max(0.0, total_window_ms - step_total_sum_ms);
+    const double unaccounted_avg_frame_ms = unaccounted_ms / static_cast<double>(frame_count_);
+    const double unaccounted_pct = total_window_ms > 1e-6 ? (100.0 * unaccounted_ms / total_window_ms) : 0.0;
+
+    std::cout << std::string(118, '-') << "\n";
+    std::cout << std::left
+              << std::setw(30) << "Unaccounted (other work)"
+              << std::setw(14) << "-"
+              << std::setw(13) << "-"
+              << std::setw(16) << "-"
+              << std::setw(16) << unaccounted_ms
+              << std::setw(16) << unaccounted_avg_frame_ms
+              << std::setw(11) << unaccounted_pct
+              << "\n";
+
+    std::cout << std::string(118, '-') << "\n";
+    std::cout << std::left
+              << std::setw(30) << "TOTAL callback"
+              << std::setw(14) << timing_total_.count
+              << std::setw(13) << 1.0
+              << std::setw(16) << avg_total_frame_ms
+              << std::setw(16) << total_window_ms
+              << std::setw(16) << avg_total_frame_ms
+              << std::setw(11) << 100.0
+              << "\n";
+
+    std::cout << std::string(118, '=') << "\n\n";
     
     // Reset counters
     timing_depth_conversion_.reset();
@@ -656,6 +700,8 @@ void PointCloudMapperNodeV5::print_timing_stats() {
     timing_publishing_.reset();
     timing_total_.reset();
     frame_count_ = 0;
+    detections_seen_total_ = 0;
+    detections_accepted_total_ = 0;
 }
 
 // ==========================================

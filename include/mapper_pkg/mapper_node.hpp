@@ -165,6 +165,8 @@ private:
     TimingStats timing_total_;
     
     int frame_count_ = 0;
+    int detections_seen_total_ = 0;
+    int detections_accepted_total_ = 0;
     std::chrono::steady_clock::time_point last_timing_print_;
     
     void print_timing_stats();
