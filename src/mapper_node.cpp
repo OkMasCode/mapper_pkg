@@ -132,13 +132,20 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr PointCloudMapperNodeV5::get_points_in_mask(
 {
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
 
-    // Iterate through the image pixels to project 2D mask to 3D Camera Coordinates
-    for (int v = 0; v < depth_m.rows; ++v) {
-        for (int u = 0; u < depth_m.cols; ++u) {
+    // SOTA Optimization: Compute the bounding box of the non-zero mask pixels.
+    // This restricts the nested loops to a tiny fraction of the image.
+    cv::Rect bbox = cv::boundingRect(binary_mask);
+
+    // If the mask is completely empty, return early
+    if (bbox.width == 0 || bbox.height == 0) return cloud;
+
+    // Iterate ONLY within the bounding box bounds
+    for (int v = bbox.y; v < bbox.y + bbox.height; ++v) {
+        for (int u = bbox.x; u < bbox.x + bbox.width; ++u) {
             if (binary_mask.at<uint8_t>(v, u) > 0) {
                 float z = depth_m.at<float>(v, u);
                 
-                // Depth gating (e.g., 0.25m to 4.0m)
+                // Depth gating
                 if (std::isfinite(z) && z >= 0.1f && z <= 4.0f) {
                     pcl::PointXYZ pt;
                     pt.x = (u - cx_) * z / fx_;

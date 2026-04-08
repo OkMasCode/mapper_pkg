@@ -234,29 +234,36 @@ float SemanticObjectMapV5::oriented_overlap_ratio(
     pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
     pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2)
 {
-    if (!points1 || !points2 || points1->empty() || points2->empty()) {
-        return 0.0f;
-    }
-    if (!obb_has_valid_shape(obb1) || !obb_has_valid_shape(obb2)) {
-        return 0.0f;
-    }
+    if (!points1 || !points2 || points1->empty() || points2->empty()) return 0.0f;
+    if (!obb_has_valid_shape(obb1) || !obb_has_valid_shape(obb2)) return 0.0f;
 
+    // SOTA Optimization: Uniformly sample max 100 points per cloud for IoU evaluation.
+    // This reduces point-in-OBB matrix operations from ~10,000 to 100 per check.
+    const size_t max_eval_points = 100;
+    
+    size_t step1 = std::max<size_t>(1, points1->points.size() / max_eval_points);
     int in_1_in_2 = 0;
-    for (const auto& p : points1->points) {
-        if (point_inside_obb(p, obb2)) {
+    int eval_1 = 0;
+    for (size_t i = 0; i < points1->points.size(); i += step1) {
+        if (point_inside_obb(points1->points[i], obb2)) {
             ++in_1_in_2;
         }
+        ++eval_1;
     }
 
+    size_t step2 = std::max<size_t>(1, points2->points.size() / max_eval_points);
     int in_2_in_1 = 0;
-    for (const auto& p : points2->points) {
-        if (point_inside_obb(p, obb1)) {
+    int eval_2 = 0;
+    for (size_t i = 0; i < points2->points.size(); i += step2) {
+        if (point_inside_obb(points2->points[i], obb1)) {
             ++in_2_in_1;
         }
+        ++eval_2;
     }
 
-    const float r12 = static_cast<float>(in_1_in_2) / static_cast<float>(std::max<size_t>(points1->points.size(), 1));
-    const float r21 = static_cast<float>(in_2_in_1) / static_cast<float>(std::max<size_t>(points2->points.size(), 1));
+    const float r12 = static_cast<float>(in_1_in_2) / static_cast<float>(std::max(eval_1, 1));
+    const float r21 = static_cast<float>(in_2_in_1) / static_cast<float>(std::max(eval_2, 1));
+    
     return std::clamp(0.5f * (r12 + r21), 0.0f, 1.0f);
 }
 
