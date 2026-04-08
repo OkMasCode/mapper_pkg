@@ -14,6 +14,7 @@
 #include <optional>
 #include <array>
 #include <iomanip>
+#include <algorithm>
 #include <Eigen/Geometry>
 #include <pcl/common/transforms.h>
 #include <tf2/exceptions.h>
@@ -274,18 +275,41 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         // ==========================================
         // SOTA: ADAPTIVE VOXELIZATION
         // ==========================================
-        float voxel_size = 0.02f; // Default to 5cm
+        // Aggressive adaptive voxelization for faster per-detection processing.
         int num_raw_points = raw_cloud->points.size();
+        float voxel_size = 0.012f;
 
-        if (num_raw_points < 10000) voxel_size = 0.005f;
-        else if (num_raw_points > 30000) voxel_size = 0.03f;
-        else voxel_size = 0.005f + (0.02f * ((num_raw_points - 10000.0f) / 25000.0f));
-        // PCL 3D Filtering: Voxel downsample (0.006m = 6mm)
+        constexpr int kMinCount = 4000;
+        constexpr int kMaxCount = 30000;
+        constexpr float kMinVoxel = 0.008f;
+        constexpr float kMaxVoxel = 0.050f;
+        constexpr int kTargetMaxDownsampledPoints = 1200;
+
+        if (num_raw_points <= kMinCount) {
+            voxel_size = kMinVoxel;
+        } else if (num_raw_points >= kMaxCount) {
+            voxel_size = kMaxVoxel;
+        } else {
+            const float t = static_cast<float>(num_raw_points - kMinCount) /
+                            static_cast<float>(kMaxCount - kMinCount);
+            voxel_size = kMinVoxel + ((kMaxVoxel - kMinVoxel) * t);
+        }
+
         pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
         voxel_filter.setInputCloud(raw_cloud);
         voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size); 
         voxel_filter.filter(*downsampled_cloud);
+
+        // Keep an upper bound on points to stabilize runtime under heavy masks.
+        if (downsampled_cloud->points.size() > kTargetMaxDownsampledPoints) {
+            float boosted_leaf = voxel_size;
+            for (int pass = 0; pass < 2 && downsampled_cloud->points.size() > kTargetMaxDownsampledPoints; ++pass) {
+                boosted_leaf = std::min(0.08f, boosted_leaf * 1.35f);
+                voxel_filter.setLeafSize(boosted_leaf, boosted_leaf, boosted_leaf);
+                voxel_filter.filter(*downsampled_cloud);
+            }
+        }
 
         // PCL 3D Filtering: Euclidean Clustering (keeps only largest contiguous cluster)
         // This removes ALL isolated/distant points even if they form clusters

@@ -120,14 +120,15 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
 
     if (combined->empty()) return combined;
 
-    // Adaptive voxelization with a wider interpolation band so scaling remains active longer.
+    // Aggressive adaptive voxelization to reduce geometry size and improve update speed.
     int num_combined = combined->points.size();
     float voxel_size = 0.01f;
 
-    constexpr int kMinCount = 5000;
+    constexpr int kMinCount = 3000;
     constexpr int kMaxCount = 80000;
-    constexpr float kMinVoxel = 0.004f;
-    constexpr float kMaxVoxel = 0.04f;
+    constexpr float kMinVoxel = 0.01f;
+    constexpr float kMaxVoxel = 0.055f;
+    constexpr int kTargetMaxDownsampledPoints = 3000;
 
     if (num_combined <= kMinCount) {
         voxel_size = kMinVoxel;
@@ -139,12 +140,22 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
         voxel_size = kMinVoxel + ((kMaxVoxel - kMinVoxel) * t);
     }
     
-    // Voxel downsample to merge overlapping points and keep memory clean (7cm)
+    // Voxel downsample to merge overlapping points and keep memory bounded.
     pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZ>());
     pcl::VoxelGrid<pcl::PointXYZ> grid;
     grid.setInputCloud(combined);
     grid.setLeafSize(voxel_size, voxel_size, voxel_size);
     grid.filter(*downsampled);
+
+    // If cloud still stays dense, increase leaf size in a couple of passes.
+    if (downsampled->points.size() > kTargetMaxDownsampledPoints) {
+        float boosted_leaf = voxel_size;
+        for (int pass = 0; pass < 2 && downsampled->points.size() > kTargetMaxDownsampledPoints; ++pass) {
+            boosted_leaf = std::min(0.10f, boosted_leaf * 1.30f);
+            grid.setLeafSize(boosted_leaf, boosted_leaf, boosted_leaf);
+            grid.filter(*downsampled);
+        }
+    }
     
     return downsampled;
 }
