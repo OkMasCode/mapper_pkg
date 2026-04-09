@@ -40,11 +40,11 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     max_range_ = this->declare_parameter("max_range", 3.0f);
     // Voxel filtering
     do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", true);
-    voxel_size_ = this->declare_parameter("voxel_size", 0.02f);
-    min_point_count_ = this->declare_parameter("min_point_count", 10000.0f);
-    max_point_count_ = this->declare_parameter("max_point_count", 50000.0f);
-    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.005f);
-    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.03f);
+    voxel_size_ = this->declare_parameter("voxel_size", 0.12f);
+    min_point_count_ = this->declare_parameter("min_point_count", 4000.0f);
+    max_point_count_ = this->declare_parameter("max_point_count", 30000.0f);
+    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.008f);
+    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.050f);
     // Clustering
     cluster_tolerance_ = this->declare_parameter("cluster_tolerance", 0.06f);
     min_cluster_size_ = this->declare_parameter("min_cluster_size", 5);
@@ -121,43 +121,6 @@ void PointCloudMapperNodeV5::text_embedding_cb(const std_msgs::msg::Float32Multi
         
         semantic_map_->set_text_embedding(emb, scale, bias);
     }
-}
-
-pcl::PointCloud<pcl::PointXYZ>::Ptr PointCloudMapperNodeV5::get_points_in_mask(
-    const cv::Mat& depth_m, 
-    const cv::Mat& binary_mask) 
-{
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
-
-    // SOTA Optimization: Compute the bounding box of the non-zero mask pixels.
-    // This restricts the nested loops to a tiny fraction of the image.
-    cv::Rect bbox = cv::boundingRect(binary_mask);
-
-    // If the mask is completely empty, return early
-    if (bbox.width == 0 || bbox.height == 0) return cloud;
-
-    // Iterate ONLY within the bounding box bounds
-    for (int v = bbox.y; v < bbox.y + bbox.height; ++v) {
-        for (int u = bbox.x; u < bbox.x + bbox.width; ++u) {
-            if (binary_mask.at<uint8_t>(v, u) > 0) {
-                float z = depth_m.at<float>(v, u);
-                
-                // Depth gating
-                if (std::isfinite(z) && z >= 0.1f && z <= 4.0f) {
-                    pcl::PointXYZ pt;
-                    pt.x = (u - cx_) * z / fx_;
-                    pt.y = (v - cy_) * z / fy_;
-                    pt.z = z;
-                    cloud->points.push_back(pt);
-                }
-            }
-        }
-    }
-    
-    cloud->width = cloud->points.size();
-    cloud->height = 1;
-    cloud->is_dense = true;
-    return cloud;
 }
 
 void PointCloudMapperNodeV5::synced_detection_callback(
@@ -272,47 +235,8 @@ void PointCloudMapperNodeV5::synced_detection_callback(
 
         auto t_filter_start = std::chrono::steady_clock::now();
 
-        // ==========================================
-        // SOTA: ADAPTIVE VOXELIZATION
-        // ==========================================
-        // Aggressive adaptive voxelization for faster per-detection processing.
-        int num_raw_points = raw_cloud->points.size();
-        float voxel_size = 0.012f;
-
-        constexpr int kMinCount = 4000;
-        constexpr int kMaxCount = 30000;
-        constexpr float kMinVoxel = 0.008f;
-        constexpr float kMaxVoxel = 0.050f;
-        constexpr int kTargetMaxDownsampledPoints = 1200;
-
-        if (num_raw_points <= kMinCount) {
-            voxel_size = kMinVoxel;
-        } else if (num_raw_points >= kMaxCount) {
-            voxel_size = kMaxVoxel;
-        } else {
-            const float t = static_cast<float>(num_raw_points - kMinCount) /
-                            static_cast<float>(kMaxCount - kMinCount);
-            voxel_size = kMinVoxel + ((kMaxVoxel - kMinVoxel) * t);
-        }
-
         pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>());
-        pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
-        voxel_filter.setInputCloud(raw_cloud);
-        voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size); 
-        voxel_filter.filter(*downsampled_cloud);
 
-        // Keep an upper bound on points to stabilize runtime under heavy masks.
-        if (downsampled_cloud->points.size() > kTargetMaxDownsampledPoints) {
-            float boosted_leaf = voxel_size;
-            for (int pass = 0; pass < 2 && downsampled_cloud->points.size() > kTargetMaxDownsampledPoints; ++pass) {
-                boosted_leaf = std::min(0.08f, boosted_leaf * 1.35f);
-                voxel_filter.setLeafSize(boosted_leaf, boosted_leaf, boosted_leaf);
-                voxel_filter.filter(*downsampled_cloud);
-            }
-        }
-
-        // PCL 3D Filtering: Euclidean Clustering (keeps only largest contiguous cluster)
-        // This removes ALL isolated/distant points even if they form clusters
         // Perform distance-based filtering only if flag is set
         if (do_voxel_filtering_) {
             // Adapt voxel size to raw cloud density.
@@ -325,7 +249,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
                 voxel_size = min_voxel_size_ + scale * (max_voxel_size_ - min_voxel_size_);
             }
             // Downsample cloud before clustering.
-            pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>());
             pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
             voxel_filter.setInputCloud(raw_cloud);
             voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size); 

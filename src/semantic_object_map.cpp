@@ -110,6 +110,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
     pcl::PointCloud<pcl::PointXYZ>::Ptr old_points, 
     pcl::PointCloud<pcl::PointXYZ>::Ptr new_points) 
 {
+    // Simple fusion by concatenation followed by voxel downsampling to reduce duplicates and noise.
     pcl::PointCloud<pcl::PointXYZ>::Ptr combined(new pcl::PointCloud<pcl::PointXYZ>());
     
     if (old_points && !old_points->empty()) *combined += *old_points;
@@ -117,46 +118,25 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
 
     if (combined->empty()) return combined;
 
-    // Aggressive adaptive voxelization to reduce geometry size and improve update speed.
+    // Adaptive voxelization
     int num_combined = combined->points.size();
-    float voxel_size = 0.01f;
 
-    constexpr int kMinCount = 3000;
-    constexpr int kMaxCount = 80000;
-    constexpr float kMinVoxel = 0.01f;
-    constexpr float kMaxVoxel = 0.055f;
-    constexpr int kTargetMaxDownsampledPoints = 3000;
-
-    if (num_combined <= kMinCount) {
-        voxel_size = kMinVoxel;
-    } else if (num_combined >= kMaxCount) {
-        voxel_size = kMaxVoxel;
+    if (num_combined <= min_point_count) {
+        voxel_size = min_voxel_size;
+    } else if (num_combined >= max_point_count) {
+        voxel_size = max_voxel_size;
     } else {
-        const float t = static_cast<float>(num_combined - kMinCount) /
-                        static_cast<float>(kMaxCount - kMinCount);
-        voxel_size = kMinVoxel + ((kMaxVoxel - kMinVoxel) * t);
+        const float t = static_cast<float>(num_combined - min_point_count) /
+                        static_cast<float>(max_point_count - min_point_count);
+        voxel_size = min_voxel_size + ((max_voxel_size - min_voxel_size) * t);
     }
     
-<<<<<<< HEAD
-    // Voxel downsample to merge overlapping points and keep memory bounded.
-=======
     // Downsample to reduce duplicate points after fusion.
->>>>>>> 00e5391 (Removed export callback)
     pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZ>());
     pcl::VoxelGrid<pcl::PointXYZ> grid;
     grid.setInputCloud(combined);
     grid.setLeafSize(voxel_size, voxel_size, voxel_size);
     grid.filter(*downsampled);
-
-    // If cloud still stays dense, increase leaf size in a couple of passes.
-    if (downsampled->points.size() > kTargetMaxDownsampledPoints) {
-        float boosted_leaf = voxel_size;
-        for (int pass = 0; pass < 2 && downsampled->points.size() > kTargetMaxDownsampledPoints; ++pass) {
-            boosted_leaf = std::min(0.10f, boosted_leaf * 1.30f);
-            grid.setLeafSize(boosted_leaf, boosted_leaf, boosted_leaf);
-            grid.filter(*downsampled);
-        }
-    }
     
     return downsampled;
 }
@@ -283,7 +263,7 @@ void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {
     if (objects.find(map_id) == objects.end()) return;
     
     auto& obj = objects[map_id];
-    if (obj.accumulated_points->points.size() < 20) return;
+    if (obj.accumulated_points->points.size() < static_cast<size_t>(refine_min_point_count)) return;
 
     // Use Euclidean clustering and keep the dominant cluster only.
     pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
@@ -291,9 +271,9 @@ void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {
 
     std::vector<pcl::PointIndices> cluster_indices;
     pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-    ec.setClusterTolerance(0.06); // 6cm distance to keep cluster together
-    ec.setMinClusterSize(70);
-    ec.setMaxClusterSize(25000);
+    ec.setClusterTolerance(refine_cluster_tolerance);
+    ec.setMinClusterSize(refine_min_cluster_size);
+    ec.setMaxClusterSize(refine_max_cluster_size);
     ec.setSearchMethod(tree);
     ec.setInputCloud(obj.accumulated_points);
     ec.extract(cluster_indices);
@@ -360,6 +340,7 @@ std::string SemanticObjectMapV5::choose_consensus_class(
 }
 
 void SemanticObjectMapV5::prune_stale_state(long long current_ns) {
+    // Remove tentative tracks that haven't been updated recently.
     long long stale_tentative_ns = static_cast<long long>(tentative_max_stale_sec * 1e9);
     long long stale_binding_ns = static_cast<long long>(binding_ttl_sec * 1e9);
 
@@ -395,9 +376,23 @@ void SemanticObjectMapV5::update_object(
     auto& entry = objects[map_id];
 
     entry.accumulated_points = fuse_geometry(entry.accumulated_points, points_map);
-    entry.obb = compute_obb(entry.accumulated_points);
-    entry.pose_map = entry.obb.center;
+    entry.obb = compute_obb(entry.accumulated_points); // recompute OBB after geometry fusion
+    if (obb_has_valid_shape(entry.obb)) {
+        entry.pose_map = entry.obb.center;
+    } else {
+        // Keep a valid centroid fallback so association code never indexes empty pose vectors.
+        if (entry.accumulated_points && !entry.accumulated_points->empty()) {
+            Eigen::Vector4f centroid;
+            pcl::compute3DCentroid(*entry.accumulated_points, centroid);
+            entry.pose_map = {centroid[0], centroid[1], centroid[2]};
+        } else {
+            entry.pose_map = {0.0f, 0.0f, 0.0f};
+        }
 
+        std::cout << "[SemanticObjectMap] warning: invalid OBB for map_id=" << map_id
+                  << " after geometry fusion, using centroid fallback pose\n";
+    }
+    // Update class votes and confidence sums for consensus.
     entry.class_votes[object_name] += std::max(confidence, 0.01f);
     entry.class_counts[object_name] += 1;
     entry.class_conf_sums[object_name] += std::max(confidence, 0.01f);
@@ -441,11 +436,13 @@ bool SemanticObjectMapV5::update_tentative(
     long long current_ns,
     const std::string& frame)
 {
+    // Ignore detections that cannot contribute usable geometry.
     if (!points_map || points_map->empty()) {
         std::cout << "[SemanticObjectMap] tentative skip: empty cloud for track=" << tracker_id << "\n";
         return false;
     }
 
+    // Confidence gate keeps low-quality detections out of tentative state.
     if (confidence < min_input_confidence) {
         std::cout << "[SemanticObjectMap] tentative skip: low confidence=" << confidence
                   << " threshold=" << min_input_confidence << " track=" << tracker_id << "\n";
@@ -454,6 +451,7 @@ bool SemanticObjectMapV5::update_tentative(
 
     auto it = tentative_tracks.find(tracker_id);
     if (it == tentative_tracks.end()) {
+        // First sighting for this tracker: create tentative track record.
         TentativeTrack t;
         t.track_id = tracker_id;
         t.frame = frame;
@@ -480,6 +478,7 @@ bool SemanticObjectMapV5::update_tentative(
     }
 
     auto& t = it->second;
+    // Existing tentative track: fuse evidence and update running statistics.
     t.accumulated_points = fuse_geometry(t.accumulated_points, points_map);
     t.hits += 1;
     t.last_seen_ns = current_ns;
@@ -515,6 +514,7 @@ bool SemanticObjectMapV5::update_tentative(
     }
 
     std::string map_id = new_map_id();
+    // Promotion path: instantiate a stable map object from tentative evidence.
     MapObject obj;
     obj.map_id = map_id;
     obj.frame = frame;
@@ -586,12 +586,14 @@ void SemanticObjectMapV5::add_detections_batch(
     for (size_t i = 0; i < points_cam_list.size(); ++i) {
         std::string t_id = tracker_ids[i];
         bool matched = false;
-
+        
         if (track_to_map.count(t_id) && objects.count(track_to_map[t_id])) {
+            //I already have the traker ID in the map
             std::string map_id = track_to_map[t_id];
             
             // Guard against class flips for reused tracker IDs.
             if (object_names[i] == objects[map_id].current_name) {
+                // I have an object with same ID and same class in the map, so I will update it with the new detection and embedding.
                 const std::vector<float> image_embedding_masked = embeddings_list_masked[i].has_value() ? embeddings_list_masked[i].value() : std::vector<float>{};
                 const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[i].has_value() ? embeddings_list_unmasked[i].value() : std::vector<float>{};
                 float similarity = 0.0f;
@@ -606,6 +608,7 @@ void SemanticObjectMapV5::add_detections_batch(
         } 
 
         if (!matched) {
+            // I don't have the tracker ID in the map
             unmatched_indices.push_back(i);
         }
     }
@@ -617,6 +620,7 @@ void SemanticObjectMapV5::add_detections_batch(
     for (const auto& pair : objects) map_ids.push_back(pair.first);
 
     if (map_ids.empty()) {
+    // No existing map objects to associate with, so route all unmatched detections to tentative tracks.
         std::cout << "[SemanticObjectMap] map empty: routing " << unmatched_indices.size()
                   << " detections to tentative tracks\n";
         for (int det_idx : unmatched_indices) {
@@ -636,64 +640,88 @@ void SemanticObjectMapV5::add_detections_batch(
         return; 
     }
 
+    // N: unmatched detections, M: currently tracked map objects.
     int N = unmatched_indices.size();
     int M = map_ids.size();
     std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, 0.0));
-
-    double w_sem = 1.5;
-    double MAX_COST = 4.0;
-    constexpr double kBlockedCost = 999.0;
-    constexpr int kTopKPerDetection = 3;
-
     for (int i = 0; i < N; ++i) {
         int det_idx = unmatched_indices[i];
+        // Compute detection geometry once and reuse it for all candidate objects.
         OrientedBoundingBox det_obb = compute_obb(points_cam_list[det_idx]);
 
-        // Stage 1: Cheap preselection (distance + class), no IoU/embedding yet.
+        if (!obb_has_valid_shape(det_obb)) {
+            std::cout << "[SemanticObjectMap] batch skip geom: invalid detection OBB det_idx=" << det_idx
+                      << " track=" << tracker_ids[det_idx]
+                      << " points=" << (points_cam_list[det_idx] ? points_cam_list[det_idx]->size() : 0)
+                      << "\n";
+            continue;
+        }
+
+        // Stage 1: cheap screening to prune impossible/weak candidates.
         std::vector<std::pair<double, int>> cheap_candidates;
         cheap_candidates.reserve(M);
 
         for (int j = 0; j < M; ++j) {
             auto& map_obj = objects[map_ids[j]];
 
-            // Distance between detection center and object center.
+            const bool has_pose = map_obj.pose_map.size() >= 3;
+            const bool has_obb = obb_has_valid_shape(map_obj.obb);
+            if (!has_pose || !has_obb) {
+                std::cout << "[SemanticObjectMap] batch skip geom: invalid map geometry map_id=" << map_ids[j]
+                          << " has_pose=" << (has_pose ? "1" : "0")
+                          << " has_obb=" << (has_obb ? "1" : "0")
+                          << "\n";
+                costMatrix[i][j] = kBlockedCost;
+                continue;
+            }
+
+            // Center-to-center distance in map frame.
             double dx = det_obb.center[0] - map_obj.pose_map[0];
             double dy = det_obb.center[1] - map_obj.pose_map[1];
             double dz = det_obb.center[2] - map_obj.pose_map[2];
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
             
-            // Scale-aware weighting keeps small objects strict and large objects permissive.
+            // Scale-aware weighting: strict for small objects, permissive for large ones.
             float max_size_det = std::max({det_obb.extents[0], det_obb.extents[1], det_obb.extents[2]});
             float max_size_map = std::max({map_obj.obb.extents[0], map_obj.obb.extents[1], map_obj.obb.extents[2]});
             float max_size = std::max(max_size_det, max_size_map);
 
-            double dynamic_w_dist = 1.0;
-            double dynamic_w_iou = 2.0;
-            if (max_size < 0.2f) {
+            const float small_size = association_small_object_max_size;
+            const float large_size = association_large_object_min_size;
+            const double small_dist_weight = association_small_object_dist_weight;
+            const double small_iou_weight = association_small_object_iou_weight;
+            const double large_dist_weight = association_large_object_dist_weight;
+            const double large_iou_weight = association_large_object_iou_weight;
+
+            double dynamic_w_dist = small_dist_weight;
+            double dynamic_w_iou = small_iou_weight;
+            if (max_size < small_size) {
                 // Small objects are sensitive to drift.
-                dynamic_w_dist = 3.0; 
-                dynamic_w_iou = 2.0;
-            } else if (max_size > 2.0f) {
+                dynamic_w_dist = small_dist_weight; 
+                dynamic_w_iou = small_iou_weight;
+            } else if (max_size > large_size) {
                 // Large objects can tolerate wider centroid shifts.
-                dynamic_w_dist = 0.2;
-                dynamic_w_iou = 0.3;
+                dynamic_w_dist = large_dist_weight;
+                dynamic_w_iou = large_iou_weight;
             } else {
                 // Interpolate smoothly between the two regimes.
-                double ratio = (max_size - 0.2f) / 1.8f;
-                dynamic_w_dist = 3.0 - (2.8 * ratio);
-                dynamic_w_iou = 2.0 - (1.7 * ratio);
+                const double span = std::max(static_cast<double>(large_size - small_size), 1e-6);
+                const double ratio = (max_size - small_size) / span;
+                dynamic_w_dist = small_dist_weight - ((small_dist_weight - large_dist_weight) * ratio);
+                dynamic_w_iou = small_iou_weight - ((small_iou_weight - large_iou_weight) * ratio);
             }
 
-            // Hard gate that rejects implausible jumps before running the optimizer.
+            // Hard spatial gate to avoid evaluating unrealistic matches.
             double dynamic_max_dist = std::max(0.4f, max_size * 1.2f);
             if (dist > dynamic_max_dist) {
                 costMatrix[i][j] = kBlockedCost;
                 continue;
             }
 
-            double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 3.0 : 0.0;
+            double class_penalty = (object_names[det_idx] != map_obj.current_name) ? max_class_penalty : 0.0;
             const double cheap_cost = (dynamic_w_dist * dist) + class_penalty;
             cheap_candidates.push_back({cheap_cost, j});
+            // Default to blocked; only top-K survivors get a full final score.
             costMatrix[i][j] = kBlockedCost;
         }
 
@@ -701,7 +729,7 @@ void SemanticObjectMapV5::add_detections_batch(
             continue;
         }
 
-        // Keep only top-K candidates per detection for expensive scoring.
+        // Keep only top-K cheapest candidates for expensive IoU+embedding scoring.
         const int keep = std::min<int>(kTopKPerDetection, static_cast<int>(cheap_candidates.size()));
         if (keep < static_cast<int>(cheap_candidates.size())) {
             std::nth_element(
@@ -720,7 +748,14 @@ void SemanticObjectMapV5::add_detections_batch(
             const int j = cheap_candidates[c].second;
             auto& map_obj = objects[map_ids[j]];
 
-            // Recompute raw distance terms for final cost on shortlisted pairs.
+            const bool has_pose = map_obj.pose_map.size() >= 3;
+            const bool has_obb = obb_has_valid_shape(map_obj.obb);
+            if (!has_pose || !has_obb) {
+                costMatrix[i][j] = kBlockedCost;
+                continue;
+            }
+
+            // Stage 2: compute full cost on shortlisted pairs only.
             double dx = det_obb.center[0] - map_obj.pose_map[0];
             double dy = det_obb.center[1] - map_obj.pose_map[1];
             double dz = det_obb.center[2] - map_obj.pose_map[2];
@@ -730,21 +765,29 @@ void SemanticObjectMapV5::add_detections_batch(
             float max_size_map = std::max({map_obj.obb.extents[0], map_obj.obb.extents[1], map_obj.obb.extents[2]});
             float max_size = std::max(max_size_det, max_size_map);
 
-            double dynamic_w_dist = 1.0;
-            double dynamic_w_iou = 2.0;
-            if (max_size < 0.2f) {
-                dynamic_w_dist = 3.0;
-                dynamic_w_iou = 2.0;
-            } else if (max_size > 2.0f) {
-                dynamic_w_dist = 0.2;
-                dynamic_w_iou = 0.3;
+            const float small_size = association_small_object_max_size;
+            const float large_size = association_large_object_min_size;
+            const double small_dist_weight = association_small_object_dist_weight;
+            const double small_iou_weight = association_small_object_iou_weight;
+            const double large_dist_weight = association_large_object_dist_weight;
+            const double large_iou_weight = association_large_object_iou_weight;
+
+            double dynamic_w_dist = small_dist_weight;
+            double dynamic_w_iou = small_iou_weight;
+            if (max_size < small_size) {
+                dynamic_w_dist = small_dist_weight;
+                dynamic_w_iou = small_iou_weight;
+            } else if (max_size > large_size) {
+                dynamic_w_dist = large_dist_weight;
+                dynamic_w_iou = large_iou_weight;
             } else {
-                double ratio = (max_size - 0.2f) / 1.8f;
-                dynamic_w_dist = 3.0 - (2.8 * ratio);
-                dynamic_w_iou = 2.0 - (1.7 * ratio);
+                const double span = std::max(static_cast<double>(large_size - small_size), 1e-6);
+                const double ratio = (max_size - small_size) / span;
+                dynamic_w_dist = small_dist_weight - ((small_dist_weight - large_dist_weight) * ratio);
+                dynamic_w_iou = small_iou_weight - ((small_iou_weight - large_iou_weight) * ratio);
             }
 
-            // 2. Geometric & Semantic Costs
+            // Geometric overlap and semantic similarity terms.
             double iou = compute_obb_iou(points_cam_list[det_idx], det_obb, map_obj.accumulated_points, map_obj.obb);
             double cost_sem = 1.0;
             if (embeddings_list_masked[det_idx].has_value() && !map_obj.image_embedding_masked.empty()) {
@@ -752,14 +795,14 @@ void SemanticObjectMapV5::add_detections_batch(
                 cost_sem = 1.0 - static_cast<double>(similarity);
             }
 
-            double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 3.0 : 0.0;
+            double class_penalty = (object_names[det_idx] != map_obj.current_name) ? max_class_penalty : 0.0;
 
             // Final combined assignment cost.
             costMatrix[i][j] = (dynamic_w_dist * dist) + (dynamic_w_iou * (1.0 - iou)) + (w_sem * cost_sem) + class_penalty;
         }
     }
 
-    // Solve assignment with Hungarian optimization.
+    // Global one-to-one assignment over the final cost matrix.
     HungarianAlgorithm HungAlgo;
     std::vector<int> assignment;
     HungAlgo.Solve(costMatrix, assignment);
@@ -768,6 +811,7 @@ void SemanticObjectMapV5::add_detections_batch(
         int map_idx = assignment[i];
         int det_idx = unmatched_indices[i];
         
+        // Accept only assignments that exist and pass the quality threshold.
         if (map_idx >= 0 && costMatrix[i][map_idx] < MAX_COST) {
             std::string m_id = map_ids[map_idx];
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
@@ -777,11 +821,12 @@ void SemanticObjectMapV5::add_detections_batch(
             if (!image_embedding_masked.empty() && !map_obj.image_embedding_masked.empty()) {
                 similarity = compute_embedding_similarity(image_embedding_masked, map_obj.image_embedding_masked) * 100.0f;
             }
+            // Update matched stable object and refresh tracker binding.
             update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding_masked, image_embedding_unmasked, current_ns, tracker_ids[det_idx]);
             track_to_map[tracker_ids[det_idx]] = m_id;
             track_last_seen_ns[tracker_ids[det_idx]] = current_ns;
         } else {
-            // Unmatched detections are accumulated as tentative tracks.
+            // Rejected/unassigned detections keep accumulating as tentative tracks.
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
             const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
             update_tentative(

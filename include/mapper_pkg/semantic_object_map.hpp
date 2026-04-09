@@ -87,7 +87,7 @@ struct TentativeTrack {
 // Core mapper that associates detections, tracks object state, and maintains geometry.
 
 class SemanticObjectMapV5 {
-public:
+    public:
     SemanticObjectMapV5();
     ~SemanticObjectMapV5() = default;
 
@@ -99,23 +99,46 @@ public:
     std::unordered_map<std::string, std::string> track_to_map;
     std::unordered_map<std::string, long long> track_last_seen_ns;
 
-    // Runtime thresholds and association weights.
+    // Update tentative parameters
     float min_input_confidence = 0.55f;
-    float min_detection_depth_m = 0.25f;
-    float max_detection_depth_m = 6.0f;
     int confirmation_min_hits = 6;
-    float confirmation_time_window_sec = 2.5f;
     float confirmation_min_age_sec = 0.8f;
-    float min_confidence_for_promotion = 0.50f;
+    float min_confidence_for_promotion = 0.6f;
     float min_avg_confidence_for_promotion = 0.55f;
+    // stale pruning parameters
     float tentative_max_stale_sec = 2.0f;
     float binding_ttl_sec = 4.0f;
     float confidence_ema_alpha = 0.20f;
-    
+    // class consensus parameters
     float class_count_weight = 1.0f;
     float class_confidence_weight = 2.0f;
     float class_switch_margin = 0.75f;
     int min_class_votes_to_lock = 4;
+    // voxel filtering
+    float voxel_size = 0.01f;
+    float min_point_count = 3000.0f;
+    float max_point_count = 80000.0f;
+    float min_voxel_size = 0.01f;
+    float max_voxel_size = 0.055f;
+    // geometry refinement parameters
+    int refine_min_point_count = 20;
+    double refine_cluster_tolerance = 0.06;
+    int refine_min_cluster_size = 70;
+    int refine_max_cluster_size = 25000;
+    // scoring parameters
+    double w_sem = 1.5;
+    double MAX_COST = 4.0;
+    double kBlockedCost = 999.0;
+    int kTopKPerDetection = 3;
+    double max_class_penalty = 3.0;
+    // Dynamic association weights based on object size.
+    float association_small_object_max_size = 0.2f;
+    float association_large_object_min_size = 2.0f;
+    double association_small_object_dist_weight = 3.0;
+    double association_small_object_iou_weight = 2.0;
+    double association_large_object_dist_weight = 0.2;
+    double association_large_object_iou_weight = 0.3;
+
 
     // Adds a synchronized batch of detections and updates object memory.
     void add_detections_batch(
@@ -147,7 +170,7 @@ public:
     // Computes object-to-goal similarity using the stored goal embedding.
     float get_goal_similarity(const std::string& map_id) const;
 
-private:
+    private:
     int next_map_id_ = 1;
 
     std::vector<float> goal_text_embedding_;
