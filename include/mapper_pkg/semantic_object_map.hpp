@@ -9,20 +9,16 @@
 #include <optional>
 #include <array>
 
-// ROS 2 Time and Transforms
 #include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
-// PCL (Point Cloud Library)
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
-// Forward declaration of the OBB struct that we will implement in the .cpp file
-// based on the robinvista/pointcloud-OBB logic.
 struct OrientedBoundingBox {
     std::vector<float> center{0.0f, 0.0f, 0.0f};
     std::vector<float> extents{0.0f, 0.0f, 0.0f}; // length, width, height
-    // Row-major 3x3 rotation matrix for local->world transform.
+    // Row-major 3x3 rotation matrix mapping local coordinates to world coordinates.
     std::vector<float> rotation{
         1.0f, 0.0f, 0.0f,
         0.0f, 1.0f, 0.0f,
@@ -30,31 +26,29 @@ struct OrientedBoundingBox {
     };
 };
 
-// ==========================================
-// 1. DATA STRUCTURES (Replaces Python @dataclass)
-// ==========================================
+// Persistent object entry stored in the semantic map.
 
 struct MapObject {
     std::string map_id;
     std::string frame;
     builtin_interfaces::msg::Time timestamp;
     
-    // Geometry
+    // Geometry accumulated over multiple observations.
     pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
     OrientedBoundingBox obb; 
     
-    // Tracking & Lifecycle
+    // Lifecycle statistics used for stability and pruning.
     int occurrences = 0;
     long long first_seen_ns = 0;
     long long last_seen_ns = 0;
     
-    // Semantic Voting
+    // Running class evidence for consensus naming.
     std::string current_name;
     std::unordered_map<std::string, float> class_votes;
     std::unordered_map<std::string, int> class_counts;
     std::unordered_map<std::string, float> class_conf_sums;
     
-    // Embeddings & Confidence
+    // Similarity and embedding history used for association and goal scoring.
     float similarity = 0.0f;
     float confidence_ema = 0.0f;
     std::vector<float> image_embedding_masked;
@@ -62,25 +56,26 @@ struct MapObject {
     float embedding_confidence_max = -1.0f;
     std::string source_track_id;
 
-    // Cached state to prevent recomputing for ROS messages
+    // Cached poses reused by message publishing paths.
     std::vector<float> pose_cam{0.0f, 0.0f, 0.0f};
     std::vector<float> pose_map{0.0f, 0.0f, 0.0f};
 };
 
+// Temporary track that must mature before promotion into the persistent map.
 struct TentativeTrack {
     std::string track_id;
     std::string frame;
     builtin_interfaces::msg::Time timestamp;
     
-    // Geometry
+    // Geometry collected while the track is still tentative.
     pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
     
-    // Tracking
+    // Promotion counters and timestamps.
     int hits = 0;
     long long first_seen_ns = 0;
     long long last_seen_ns = 0;
     
-    // Semantics
+    // Class and embedding evidence collected before promotion.
     std::string class_name;
     float confidence_max = 0.0f;
     float confidence_sum = 0.0f;
@@ -89,24 +84,22 @@ struct TentativeTrack {
     float embedding_confidence_max = -1.0f;
 };
 
-// ==========================================
-// 2. THE MAPPER ENGINE
-// ==========================================
+// Core mapper that associates detections, tracks object state, and maintains geometry.
 
 class SemanticObjectMapV5 {
 public:
     SemanticObjectMapV5();
     ~SemanticObjectMapV5() = default;
 
-    // The primary memory banks
+    // Main object stores.
     std::unordered_map<std::string, MapObject> objects;
     std::unordered_map<std::string, TentativeTrack> tentative_tracks;
     
-    // Tracker relationships
+    // Tracker binding tables.
     std::unordered_map<std::string, std::string> track_to_map;
     std::unordered_map<std::string, long long> track_last_seen_ns;
 
-    // Tuning Parameters (Mapped directly from Python)
+    // Runtime thresholds and association weights.
     float min_input_confidence = 0.55f;
     float min_detection_depth_m = 0.25f;
     float max_detection_depth_m = 6.0f;
@@ -124,8 +117,7 @@ public:
     float class_switch_margin = 0.75f;
     int min_class_votes_to_lock = 4;
 
-    // --- Core Public Interface ---
-
+    // Adds a synchronized batch of detections and updates object memory.
     void add_detections_batch(
         const std::vector<std::string>& object_names,
         const std::vector<std::string>& tracker_ids,
@@ -137,16 +129,22 @@ public:
         const std::string& camera_frame,
         const std::string& map_frame);
 
+    // Merges map objects that overlap strongly and represent the same class.
     void resolve_overlapping_duplicates();
 
+    // Removes stale low-support objects that are likely false positives.
     void remove_wrong_detections();
     
+    // Keeps only the dominant geometric cluster for a map object.
     void refine_object_geometry(const std::string& map_id);
 
+    // Returns the eight world-space corners of an oriented box.
     std::array<std::array<float, 3>, 8> compute_obb_corners(const OrientedBoundingBox& obb) const;
     
+    // Stores the text embedding used for global goal matching.
     void set_text_embedding(const std::vector<float>& emb, float scale, float bias);
 
+    // Computes object-to-goal similarity using the stored goal embedding.
     float get_goal_similarity(const std::string& map_id) const;
 
 private:
@@ -156,21 +154,19 @@ private:
     float logit_scale_ = 1.0f;
     float logit_bias_ = 0.0f;
 
-    // --- State Management Helpers ---
-    
+    // State cleanup and timestamp helpers.
     void prune_stale_state(long long current_ns);
     std::string new_map_id();
     long long stamp_to_ns(const builtin_interfaces::msg::Time& stamp);
 
-    // --- Geometry & Math Helpers ---
-    
+    // Embedding and geometry utilities.
     std::vector<float> normalize_embedding(const std::vector<float>& embedding) const;
     
     std::vector<float> fuse_embeddings_running_avg(
         const std::vector<float>& current_embedding, int current_count,
         const std::vector<float>& new_embedding, int new_count);
     
-    // Image-to-image cosine similarity for object correspondence
+    // Image-to-image cosine similarity used for correspondence.
     float compute_embedding_similarity(
         const std::vector<float>& emb1,
         const std::vector<float>& emb2);
@@ -190,8 +186,7 @@ private:
         pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
         pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2);
 
-    // --- Update Logic Helpers ---
-
+    // Internal update routines for tentative and confirmed objects.
     bool update_tentative(
         const std::string& object_name,
         const std::string& tracker_id,

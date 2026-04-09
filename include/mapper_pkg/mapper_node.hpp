@@ -1,7 +1,7 @@
 #ifndef POINTCLOUD_MAPPER_NODE_V5_HPP_
 #define POINTCLOUD_MAPPER_NODE_V5_HPP_
 
-// Standard C++ Libraries
+// Standard C++ libraries.
 #include <mutex>
 #include <string>
 #include <vector>
@@ -9,42 +9,42 @@
 #include <tuple>
 #include <chrono>
 
-// ROS 2 Core
+// ROS 2 core.
 #include <rclcpp/rclcpp.hpp>
 
-// ROS 2 Standard Messages
+// ROS 2 standard messages.
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 
-// TF2 for Coordinate Transformations (Camera -> Map)
+// TF2 transforms between sensor and map frames.
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
-// OpenCV & CV Bridge for Image manipulation
-#include <cv_bridge/cv_bridge.hpp>
+// OpenCV and cv_bridge for image conversion.
+#include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 
-// Message Filters for Exact/Approximate Time Synchronization
+// Message filters for synchronized streams.
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/synchronizer.h>
 
-// PCL (Point Cloud Library) for built-in 3D processing
+// PCL for 3D point cloud processing.
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
-// Custom Messages (These must match your package generation)
+// Package message types.
 #include "yolo11_seg_interfaces/msg/detected_object_v3_array.hpp"
 #include "yolo11_seg_interfaces/msg/semantic_object_array.hpp"
 #include "yolo11_seg_interfaces/msg/semantic_object.hpp"
 
-// Forward declaration of the mapper logic class to keep this header clean
+// Forward declaration to avoid including implementation details here.
 class SemanticObjectMapV5;
 
-// Timing statistics structure for tracking step performance
+// Rolling timing accumulator for periodic performance reporting.
 struct TimingStats {
     double total_time_ms = 0.0;
     int count = 0;
@@ -61,55 +61,45 @@ struct TimingStats {
 
 class PointCloudMapperNodeV5 : public rclcpp::Node {
 public:
-    // Constructor: Sets up parameters, topics, and memory
+    // Initializes parameters, subscriptions, publishers, and mapper state.
     PointCloudMapperNodeV5();
     
-    // Destructor
+    // Uses default destruction behavior.
     ~PointCloudMapperNodeV5() override = default;
 
-    // Called during Ctrl+C to ensure the final map is exported safely
+    // Invoked on shutdown to finalize map export-related work.
     void shutdown_callback();
 
 private:
-    // ==========================================
-    // ROS 2 CALLBACKS
-    // ==========================================
-    
-    // Grabs the fx, fy, cx, cy lens parameters required for 3D projection
+    // Receives camera intrinsics used for depth projection.
     void camera_info_cb(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
+
+    // Receives global text embedding used for similarity scoring.
     void text_embedding_cb(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
 
-    // The main loop: Fires when YOLO masks and Depth images arrive together
+    // Main synchronized callback for detections and depth.
     void synced_detection_callback(
         const yolo11_seg_interfaces::msg::DetectedObjectV3Array::ConstSharedPtr mask_msg,
         const sensor_msgs::msg::Image::ConstSharedPtr depth_msg);
 
-    // Periodic timer to trigger map cleanup and JSON export routines
+    // Periodic maintenance callback for cleanup and republishing.
     void export_callback();
 
-    // ==========================================
-    // HELPER FUNCTIONS
-    // ==========================================
-    
-    // Projects a 2D binary mask and Depth image into a 3D PCL Point Cloud
+    // Projects a binary mask and depth image to a 3D point cloud.
     pcl::PointCloud<pcl::PointXYZ>::Ptr get_points_in_mask(
         const cv::Mat& depth_m, 
         const cv::Mat& binary_mask);
 
-    // Translates the C++ mapper state into custom ROS 2 messages
+    // Publishes the semantic object map message.
     void publish_semantic_map();
 
-    // Publishes all accumulated object points as a colored cloud for RViz
+    // Publishes accumulated map geometry as a colored point cloud.
     void publish_stable_pointcloud();
 
-    // Generates a deterministic, bright RGB color based on the class name
+    // Generates deterministic RGB values from a stable string key.
     std::tuple<uint8_t, uint8_t, uint8_t> class_to_color_rgb(const std::string& class_name);
 
-    // ==========================================
-    // MEMBER VARIABLES
-    // ==========================================
-
-    // Node Parameters
+    // Configurable node parameters.
     std::string dm_topic_;
     std::string map_frame_;
     std::string camera_frame_;
@@ -121,41 +111,41 @@ private:
     double export_interval_;
     bool publish_stable_pointcloud_enabled_;
     
-    // Camera Intrinsics
+    // Camera intrinsics from CameraInfo.
     double fx_, fy_, cx_, cy_;
     bool intrinsics_ready_;
 
-    // Thread Safety: Prevents the export timer and camera callback from crashing each other
+    // Guards shared mapper state across callbacks and timer threads.
     std::mutex mutex_;
 
-    // Pointer to the core logic class that tracks and merges objects
+    // Core semantic mapping engine.
     std::unique_ptr<SemanticObjectMapV5> semantic_map_;
 
-    // TF2 Transforms
+    // TF2 transform interfaces.
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-    // ROS 2 Subscribers
+    // Input subscriptions.
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_info_sub_;
     message_filters::Subscriber<yolo11_seg_interfaces::msg::DetectedObjectV3Array> mask_sub_;
     message_filters::Subscriber<sensor_msgs::msg::Image> depth_sub_;
 
-    // Text Embedding and SigLIP State
+    // Text embedding input channel.
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr text_emb_sub_;
     
-    // ROS 2 Synchronizer Definition (Matches masks with depth based on timestamps)
+    // Synchronizer that pairs detections with depth by timestamp.
     using SyncPolicy = message_filters::sync_policies::ApproximateTime<
         yolo11_seg_interfaces::msg::DetectedObjectV3Array, 
         sensor_msgs::msg::Image>;
     using Sync = message_filters::Synchronizer<SyncPolicy>;
     std::shared_ptr<Sync> sync_;
 
-    // ROS 2 Publishers & Timers
+    // Output publishers and maintenance timer.
     rclcpp::Publisher<yolo11_seg_interfaces::msg::SemanticObjectArray>::SharedPtr map_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr stable_cloud_pub_;
     rclcpp::TimerBase::SharedPtr export_timer_;
 
-    // Timing statistics
+    // Per-stage timing accumulators.
     TimingStats timing_depth_conversion_;
     TimingStats timing_point_extraction_;
     TimingStats timing_filtering_;

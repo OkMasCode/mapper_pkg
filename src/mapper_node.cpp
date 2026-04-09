@@ -1,15 +1,15 @@
 #include "mapper_pkg/mapper_node.hpp"
 #include "mapper_pkg/semantic_object_map.hpp"
 
-// PCL Headers for 3D filtering
+// PCL headers for 3D filtering.
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl/kdtree/kdtree.h>
 #include <pcl_conversions/pcl_conversions.h>
 
-// Standard C++ and System Headers
-#include <zlib.h> // For CRC32 deterministic coloring
+// Standard C++ and system headers.
+#include <zlib.h> // CRC32 for deterministic coloring
 #include <chrono>
 #include <optional>
 #include <array>
@@ -26,46 +26,49 @@ using std::placeholders::_2;
 PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_v5") {
     RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:init] starting initialization");
 
-    // 1. Declare and load core I/O parameters
+    // Declare node parameters.
     dm_topic_ = this->declare_parameter("detection_message", "/vision/detections");
     map_frame_ = this->declare_parameter("map_frame", "camera_color_optical_frame");
     camera_frame_ = this->declare_parameter("camera_frame", "camera_color_optical_frame");
     output_dir_ = this->declare_parameter("output_dir", "/home/workspace/ros2_ws/src/yolo11_seg_bringup/config/");
     output_map_file_ = this->declare_parameter("output_map_file", "map_v6.json");
-    export_interval_ = this->declare_parameter("export_interval", 3.0);
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
     viewer_enabled_ = this->declare_parameter("viewer_enabled", true);
+    // Distance filtering
+    min_range_ = this->declare_parameter("min_range", 0.1f);
+    max_range_ = this->declare_parameter("max_range", 3.0f);
+    // Voxel filtering
+    do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", true);
+    voxel_size_ = this->declare_parameter("voxel_size", 0.02f);
+    min_point_count_ = this->declare_parameter("min_point_count", 10000.0f);
+    max_point_count_ = this->declare_parameter("max_point_count", 50000.0f);
+    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.005f);
+    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.03f);
+    // Clustering
+    cluster_tolerance_ = this->declare_parameter("cluster_tolerance", 0.06f);
+    min_cluster_size_ = this->declare_parameter("min_cluster_size", 5);
+    max_cluster_size_ = this->declare_parameter("max_cluster_size", 50000);
 
-    // Initialize the core Semantic Mapper logic (The Brain)
+    // Initialize semantic mapper logic.
     semantic_map_ = std::make_unique<SemanticObjectMapV5>();
 
-    // 2. Load and map tuning parameters directly to the mapper instance
-    // (Assuming SemanticObjectMapV5 has these as public members matching the Python logic)
-    /* semantic_map_->min_input_confidence = this->declare_parameter("min_input_confidence", 0.55);
-    semantic_map_->confirmation_min_hits = this->declare_parameter("confirmation_min_hits", 5);
-    semantic_map_->confirmation_min_age_sec = this->declare_parameter("confirmation_min_age_sec", 1.0);
-    semantic_map_->min_detection_depth_m = this->declare_parameter("min_detection_depth_m", 0.25);
-    semantic_map_->max_detection_depth_m = this->declare_parameter("max_detection_depth_m", 4.0);
-    // ... [Map the rest of the tuning parameters here] ...
-    */
-
-    // 3. Initialize Camera Intrinsics state
+    // Initialize camera intrinsic state.
     fx_ = fy_ = cx_ = cy_ = 0.0;
     intrinsics_ready_ = false;
 
-    // Initialize timing
+    // Initialize timing window state.
     last_timing_print_ = std::chrono::steady_clock::now();
 
-    // 4. Initialize TF2 Buffer and Listener for spatial transforms
+    // Initialize TF interfaces.
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // 5. Setup QoS (Quality of Service) for sensor data (Best Effort / Volatile)
+    // Use sensor-data QoS profile.
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
     auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 1), qos_profile);
 
-    // 6. Setup Subscribers
+    // Setup subscriptions.
     cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
         "/camera/camera/aligned_depth_to_color/camera_info", qos, // /camera/camera/aligned_depth_to_color/camera_info
         std::bind(&PointCloudMapperNodeV5::camera_info_cb, this, _1)
@@ -79,19 +82,15 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     mask_sub_.subscribe(this, dm_topic_, qos.get_rmw_qos_profile());
     depth_sub_.subscribe(this, "/camera/camera/aligned_depth_to_color/image_raw", qos.get_rmw_qos_profile()); // /camera/camera/aligned_depth_to_color/image_raw
 
-    // 7. Setup Approximate Time Synchronizer (Queue size = 10)
+    // Setup approximate-time synchronizer.
     sync_ = std::make_shared<Sync>(SyncPolicy(10), mask_sub_, depth_sub_);
     sync_->registerCallback(std::bind(&PointCloudMapperNodeV5::synced_detection_callback, this, _1, _2));
 
-    // 8. Setup Publishers & Timers
+    // Setup publishers and periodic maintenance timer.
     map_pub_ = this->create_publisher<yolo11_seg_interfaces::msg::SemanticObjectArray>("/vision/semantic_map_v5", 10);
     if (viewer_enabled_) {
         stable_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(stable_pointcloud_topic_, 10);
     }
-    export_timer_ = this->create_wall_timer(
-        std::chrono::duration<double>(export_interval_),
-        std::bind(&PointCloudMapperNodeV5::export_callback, this)
-    );
 
     RCLCPP_INFO(this->get_logger(), "[mapper_node_v5] ready. input=%s", dm_topic_.c_str());
 }
@@ -111,18 +110,15 @@ void PointCloudMapperNodeV5::camera_info_cb(const sensor_msgs::msg::CameraInfo::
 }
 
 void PointCloudMapperNodeV5::text_embedding_cb(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
-    // Lock the mutex to ensure thread safety with the map publisher
     std::lock_guard<std::mutex> lock(mutex_);
     
-    // We expect the embedding + 2 extra values (scale and bias) at the end
+    // Expect embedding values followed by scale and bias (last two elements of the vector).
     if (msg->data.size() > 2) {
         float bias = msg->data.back();
         float scale = msg->data[msg->data.size() - 2];
         
-        // Extract the actual embedding vector
         std::vector<float> emb(msg->data.begin(), msg->data.end() - 2);
         
-        // Pass the updated global goal to the map logic
         semantic_map_->set_text_embedding(emb, scale, bias);
     }
 }
@@ -169,10 +165,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     const sensor_msgs::msg::Image::ConstSharedPtr depth_msg) 
 {
     auto t_total_start = std::chrono::steady_clock::now();
-    
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[mapper_node_v5:sync] callback active. detections=%zu depth_encoding=%s",
-        mask_msg->detections.size(), depth_msg->encoding.c_str());
 
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -184,7 +176,11 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         return;
     }
 
-    // 1. Convert ROS Depth Image to OpenCV float32 matrix (meters)
+    /*
+    --------------PROCESS DEPTH---------------
+    */
+
+    // Convert ROS depth image to a float matrix in meters.
     auto t_depth_start = std::chrono::steady_clock::now();
     cv_bridge::CvImagePtr cv_ptr;
     try {
@@ -196,7 +192,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
 
     cv::Mat depth_m;
     if (cv_ptr->image.type() == CV_16UC1) {
-        cv_ptr->image.convertTo(depth_m, CV_32FC1, 0.001); // Convert mm to meters
+        cv_ptr->image.convertTo(depth_m, CV_32FC1, 0.001); // Convert millimeters to meters if necessary
     } else {
         depth_m = cv_ptr->image; 
     }
@@ -204,17 +200,17 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     timing_depth_conversion_.total_time_ms += std::chrono::duration<double, std::milli>(t_depth_end - t_depth_start).count();
     timing_depth_conversion_.count++;
 
-    // Transform all generated clouds into map frame before semantic fusion.
+    // Transform generated clouds into map frame before association.
     const std::string source_frame = depth_msg->header.frame_id.empty() ? camera_frame_ : depth_msg->header.frame_id;
     const rclcpp::Time source_stamp(depth_msg->header.stamp);
-    bool use_identity_tf = (source_frame == map_frame_);
+    bool use_identity_tf = (source_frame == map_frame_); // necessary for testing with camera only
     Eigen::Affine3f tf_source_to_map = Eigen::Affine3f::Identity();
 
     if (!use_identity_tf) {
         try {
             const auto tf_msg = tf_buffer_->lookupTransform(
                 map_frame_, source_frame, source_stamp, rclcpp::Duration::from_seconds(0.10));
-
+            // Populate the matrix
             tf_source_to_map.translation() <<
                 static_cast<float>(tf_msg.transform.translation.x),
                 static_cast<float>(tf_msg.transform.translation.y),
@@ -225,7 +221,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
                 static_cast<float>(tf_msg.transform.rotation.x),
                 static_cast<float>(tf_msg.transform.rotation.y),
                 static_cast<float>(tf_msg.transform.rotation.z));
-            tf_source_to_map.linear() = q.normalized().toRotationMatrix();
+            tf_source_to_map.linear() = q.normalized().toRotationMatrix(); // Update of the rotation compoment of the transform
         } catch (const tf2::TransformException& ex) {
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(), *this->get_clock(), 2000,
@@ -234,6 +230,11 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             return;
         }
     }
+
+
+    /*
+    --------------PROCESS DETECTIONS---------------
+    */
 
     std::vector<std::string> object_names;
     std::vector<std::string> tracker_ids;
@@ -244,21 +245,19 @@ void PointCloudMapperNodeV5::synced_detection_callback(
 
     int accepted_detections = 0;
 
-    // 2. Iterate through batched 2D detections
+    // Process each detection and build a map-frame batch.
     for (const auto& det : mask_msg->detections) {
         if (det.mask.width == 0 || det.mask.height == 0) continue;
 
-        // Point extraction timing
         auto t_extract_start = std::chrono::steady_clock::now();
         cv_bridge::CvImagePtr mask_ptr = cv_bridge::toCvCopy(det.mask, "mono8");
         cv::Mat cv_mask = mask_ptr->image;
 
-        // Ensure mask dimensions match depth dimensions
+        // Keep mask and depth dimensions aligned.
         if (cv_mask.size() != depth_m.size()) {
             cv::resize(cv_mask, cv_mask, depth_m.size(), 0, 0, cv::INTER_NEAREST);
         }
 
-        // Project 2D pixels to 3D point cloud
         auto raw_cloud = get_points_in_mask(depth_m, cv_mask);
         auto t_extract_end = std::chrono::steady_clock::now();
         timing_point_extraction_.total_time_ms += std::chrono::duration<double, std::milli>(t_extract_end - t_extract_start).count();
@@ -271,7 +270,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             continue;
         }
 
-        // Filtering timing
         auto t_filter_start = std::chrono::steady_clock::now();
 
         // ==========================================
@@ -315,6 +313,28 @@ void PointCloudMapperNodeV5::synced_detection_callback(
 
         // PCL 3D Filtering: Euclidean Clustering (keeps only largest contiguous cluster)
         // This removes ALL isolated/distant points even if they form clusters
+        // Perform distance-based filtering only if flag is set
+        if (do_voxel_filtering_) {
+            // Adapt voxel size to raw cloud density.
+            int num_raw_points = raw_cloud->points.size();
+
+            if (num_raw_points < min_point_count_) voxel_size = min_voxel_size_;
+            else if (num_raw_points > max_point_count_) voxel_size = max_voxel_size_;
+            else {
+                float scale = (static_cast<float>(num_raw_points) - min_point_count_) / (max_point_count_ - min_point_count_); // Linear interpolation for in between values
+                voxel_size = min_voxel_size_ + scale * (max_voxel_size_ - min_voxel_size_);
+            }
+            // Downsample cloud before clustering.
+            pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+            pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+            voxel_filter.setInputCloud(raw_cloud);
+            voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size); 
+            voxel_filter.filter(*downsampled_cloud);
+        } else {
+            downsampled_cloud = raw_cloud;
+        }
+
+        // Keep only the main contiguous cluster and drop detached fragments.
         pcl::PointCloud<pcl::PointXYZ>::Ptr clean_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         if (downsampled_cloud->points.size() > 10) {
             pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
@@ -322,15 +342,15 @@ void PointCloudMapperNodeV5::synced_detection_callback(
 
             std::vector<pcl::PointIndices> cluster_indices;
             pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-            ec.setClusterTolerance(0.06);    // 6cm distance to stay in same cluster
-            ec.setMinClusterSize(5);         // Minimum 5 points per cluster
-            ec.setMaxClusterSize(50000);     // Max cluster size (keep large objects)
+            ec.setClusterTolerance(cluster_tolerance_);
+            ec.setMinClusterSize(min_cluster_size_);
+            ec.setMaxClusterSize(max_cluster_size_);
             ec.setSearchMethod(tree);
             ec.setInputCloud(downsampled_cloud);
             ec.extract(cluster_indices);
 
             if (!cluster_indices.empty()) {
-                // Keep only the LARGEST cluster (main object, not outliers)
+                // Cluster list is size-ordered; keep the largest.
                 const auto& largest_cluster = cluster_indices[0];
                 for (const auto& idx : largest_cluster.indices) {
                     clean_cloud->points.push_back(downsampled_cloud->points[idx]);
@@ -355,8 +375,8 @@ void PointCloudMapperNodeV5::synced_detection_callback(
                 det.class_name.c_str(), det.instance_id, clean_cloud->points.size());
             continue;
         }
-
-        // Transformation timing
+        
+        // Transform the cloud into map frame for downstream association.
         auto t_tf_start = std::chrono::steady_clock::now();
         pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_map(new pcl::PointCloud<pcl::PointXYZ>());
         if (use_identity_tf) {
@@ -368,7 +388,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         timing_transformation_.total_time_ms += std::chrono::duration<double, std::milli>(t_tf_end - t_tf_start).count();
         timing_transformation_.count++;
 
-        // Append to batch lists (all points are map-frame now)
+        // Append detection data for batch association.
         object_names.push_back(det.class_name);
         tracker_ids.push_back(std::to_string(det.instance_id));
         confidences.push_back(det.confidence);
@@ -386,12 +406,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         accepted_detections++;
     }
 
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[mapper_node_v5:sync] accepted_detections=%d raw_detections=%zu src_frame=%s map_frame=%s",
-        accepted_detections, mask_msg->detections.size(), source_frame.c_str(), map_frame_.c_str());
-    detections_accepted_total_ += accepted_detections;
-
-    // 3. Pass the batch to the Semantic Mapper Logic (The Bipartite Matrix)
+    // Pass the prepared batch into semantic association logic.
     if (!points_cam_list.empty()) {
         auto t_batch_start = std::chrono::steady_clock::now();
         semantic_map_->add_detections_batch(
@@ -411,7 +426,21 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
 
     auto t_pub_start = std::chrono::steady_clock::now();
-    publish_semantic_map();
+    
+    try {
+        // Refine each object cloud before duplicate cleanup.
+        for (const auto& [map_id, entry] : semantic_map_->objects) {
+            semantic_map_->refine_object_geometry(map_id);
+        }
+
+        // Run duplicate and stale-object cleanup.
+        semantic_map_->resolve_overlapping_duplicates();
+        semantic_map_->remove_wrong_detections();
+    
+        publish_semantic_map();
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(this->get_logger(), "Export/Merge error: %s", e.what());
+    }
     
     if (publish_stable_pointcloud_enabled_) {
         publish_stable_pointcloud();
@@ -420,7 +449,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     timing_publishing_.total_time_ms += std::chrono::duration<double, std::milli>(t_pub_end - t_pub_start).count();
     timing_publishing_.count++;
     
-    // Total timing and periodic reporting
+    // Update total timing and print periodic stats.
     auto t_total_end = std::chrono::steady_clock::now();
     timing_total_.total_time_ms += std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
     timing_total_.count++;
@@ -432,6 +461,36 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         print_timing_stats();
         last_timing_print_ = now;
     }
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr PointCloudMapperNodeV5::get_points_in_mask(
+    const cv::Mat& depth_m, 
+    const cv::Mat& binary_mask) 
+{
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+
+    // Project mask pixels into camera-space 3D points.
+    for (int v = 0; v < depth_m.rows; ++v) {
+        for (int u = 0; u < depth_m.cols; ++u) {
+            if (binary_mask.at<uint8_t>(v, u) > 0) {
+                float z = depth_m.at<float>(v, u);
+                
+                // Keep only finite depth in a practical range.
+                if (std::isfinite(z) && z >= min_range_ && z <= max_range_) {
+                    pcl::PointXYZ pt;
+                    pt.x = (u - cx_) * z / fx_; // Pinhole projection to get X and Y in camera space
+                    pt.y = (v - cy_) * z / fy_;
+                    pt.z = z;
+                    cloud->points.push_back(pt);
+                }
+            }
+        }
+    }
+    
+    cloud->width = cloud->points.size();
+    cloud->height = 1;
+    cloud->is_dense = true;
+    return cloud;
 }
 
 void PointCloudMapperNodeV5::publish_semantic_map() {
@@ -450,7 +509,6 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
         obj_msg.frame = entry.frame;
         obj_msg.timestamp = entry.timestamp;
         
-        // Populate standard geometry vectors
         obj_msg.pose_cam.x = entry.pose_cam[0];
         obj_msg.pose_cam.y = entry.pose_cam[1];
         obj_msg.pose_cam.z = entry.pose_cam[2];
@@ -459,7 +517,7 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
         obj_msg.pose_map.y = entry.pose_map[1];
         obj_msg.pose_map.z = entry.pose_map[2];
 
-        // Publish true OBB metadata (extents + orientation + oriented corners).
+        // Populate oriented bounding-box metadata.
         const float sx = std::max(0.0f, entry.obb.extents[0]);
         const float sy = std::max(0.0f, entry.obb.extents[1]);
         const float sz = std::max(0.0f, entry.obb.extents[2]);
@@ -508,20 +566,18 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
     }
 
     map_pub_->publish(msg);
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[mapper_node_v5:publish_map] published objects=%zu", msg.objects.size());
 }
 
 void PointCloudMapperNodeV5::publish_stable_pointcloud() {
     if (semantic_map_->objects.empty()) return;
 
-    // Use built-in PCL type to handle RGB byte packing automatically
+    // Use XYZRGB cloud to publish per-object coloring.
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr colored_cloud(new pcl::PointCloud<pcl::PointXYZRGB>());
 
     for (const auto& [map_id, entry] : semantic_map_->objects) {
         if (!entry.accumulated_points || entry.accumulated_points->empty()) continue;
 
-        // Get RGB colors based on class name/map_id
+        // Derive deterministic color from object key.
         auto [r, g, b] = class_to_color_rgb(map_id);
 
         for (const auto& pt : entry.accumulated_points->points) {
@@ -542,7 +598,7 @@ void PointCloudMapperNodeV5::publish_stable_pointcloud() {
     colored_cloud->height = 1;
     colored_cloud->is_dense = true;
 
-    // Convert PCL cloud to ROS PointCloud2 message
+    // Convert to ROS PointCloud2 and publish.
     sensor_msgs::msg::PointCloud2 cloud_msg;
     pcl::toROSMsg(*colored_cloud, cloud_msg);
     
@@ -559,7 +615,7 @@ void PointCloudMapperNodeV5::publish_stable_pointcloud() {
 }
 
 std::tuple<uint8_t, uint8_t, uint8_t> PointCloudMapperNodeV5::class_to_color_rgb(const std::string& class_name) {
-    // Generates deterministic color matching the Python CRC32 implementation
+    // Match deterministic CRC32 coloring used in the Python pipeline.
     unsigned long crc = crc32(0L, Z_NULL, 0);
     crc = crc32(crc, reinterpret_cast<const Bytef*>(class_name.c_str()), class_name.length());
 
@@ -567,23 +623,6 @@ std::tuple<uint8_t, uint8_t, uint8_t> PointCloudMapperNodeV5::class_to_color_rgb
     uint8_t g = 60 + ((crc >> 8) & 0x7F);
     uint8_t b = 60 + ((crc >> 16) & 0x7F);
     return {r, g, b};
-}
-
-void PointCloudMapperNodeV5::export_callback() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    try {
-        // 1. Clean the point clouds for all confirmed objects
-        for (const auto& [map_id, entry] : semantic_map_->objects) {
-            semantic_map_->refine_object_geometry(map_id);
-        }
-        // Run the geometric duplicate cleanup routine
-        semantic_map_->resolve_overlapping_duplicates();
-        semantic_map_->remove_wrong_detections();
-    
-        publish_semantic_map();
-    } catch (const std::exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "Export/Merge error: %s", e.what());
-    }
 }
 
 void PointCloudMapperNodeV5::shutdown_callback() {
@@ -619,6 +658,7 @@ void PointCloudMapperNodeV5::print_timing_stats() {
     
     // Print header
     std::cout << "\n" << std::string(118, '=') << "\n";
+
     std::cout << "TIMING STATISTICS (30-second window, " << frame_count_ << " frames)\n";
     std::cout << "Total avg frame time: " << std::fixed << std::setprecision(3) << avg_total_frame_ms
               << " ms  |  Effective FPS: " << fps << "\n";
@@ -691,7 +731,7 @@ void PointCloudMapperNodeV5::print_timing_stats() {
 
     std::cout << std::string(118, '=') << "\n\n";
     
-    // Reset counters
+    // Reset counters for the next reporting window.
     timing_depth_conversion_.reset();
     timing_point_extraction_.reset();
     timing_filtering_.reset();
@@ -704,25 +744,23 @@ void PointCloudMapperNodeV5::print_timing_stats() {
     detections_accepted_total_ = 0;
 }
 
-// ==========================================
-// MAIN ENTRY POINT
-// ==========================================
+// Node entry point.
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     
     auto node = std::make_shared<PointCloudMapperNodeV5>();
 
-    // Use MultiThreadedExecutor to allow sync callback and timer to run concurrently
+    // Multi-threaded executor lets timer and sync callback run concurrently.
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
 
     try {
         executor.spin();
     } catch (const std::exception& e) {
-        // Catch interrupts cleanly
+        // Exit cleanly on executor exceptions or interrupts.
     }
 
-    // Ensure state is safely saved on Ctrl+C shutdown
+    // Run shutdown handling before process exit.
     node->shutdown_callback();
     rclcpp::shutdown();
     return 0;

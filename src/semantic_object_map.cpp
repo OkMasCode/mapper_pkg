@@ -59,14 +59,11 @@ inline bool point_inside_obb(const pcl::PointXYZ& p, const OrientedBoundingBox& 
 
 } // namespace
 
-// ---> MAKE SURE THIS FUNCTION EXISTS! <---
 SemanticObjectMapV5::SemanticObjectMapV5() {
     std::cout << "[SemanticObjectMap] Initialized with SOTA C++ Geometry and Tracking.\n";
 }
 
-// ==========================================
-// 1. GEOMETRY & MATH HELPERS
-// ==========================================
+// Geometry and embedding helpers.
 
 std::vector<float> SemanticObjectMapV5::normalize_embedding(const std::vector<float>& embedding) const {
     if (embedding.empty()) return {};
@@ -103,7 +100,7 @@ std::vector<float> SemanticObjectMapV5::fuse_embeddings_running_avg(
 float SemanticObjectMapV5::compute_embedding_similarity(const std::vector<float>& emb1, const std::vector<float>& emb2) {
     if (emb1.empty() || emb2.empty()) return 0.0f;
     
-    // DIRECT DOT PRODUCT: Both vectors are already normalized!
+    // Dot product is cosine similarity because both vectors are normalized.
     float cosine_sim = std::inner_product(emb1.begin(), emb1.end(), emb2.begin(), 0.0f);
     
     return std::max(0.0f, std::min(1.0f, cosine_sim));
@@ -140,7 +137,11 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
         voxel_size = kMinVoxel + ((kMaxVoxel - kMinVoxel) * t);
     }
     
+<<<<<<< HEAD
     // Voxel downsample to merge overlapping points and keep memory bounded.
+=======
+    // Downsample to reduce duplicate points after fusion.
+>>>>>>> 00e5391 (Removed export callback)
     pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZ>());
     pcl::VoxelGrid<pcl::PointXYZ> grid;
     grid.setInputCloud(combined);
@@ -164,20 +165,20 @@ OrientedBoundingBox SemanticObjectMapV5::compute_obb(pcl::PointCloud<pcl::PointX
     OrientedBoundingBox obb;
     if (!cloud || cloud->points.size() < 4) return obb;
 
-    // 1. Compute Centroid
+    // Compute cloud centroid.
     Eigen::Vector4f pcaCentroid;
     pcl::compute3DCentroid(*cloud, pcaCentroid);
     
-    // 2. Compute Covariance Matrix and extract Eigenvectors (PCA)
+    // Compute PCA basis from covariance.
     Eigen::Matrix3f covariance;
     pcl::computeCovarianceMatrixNormalized(*cloud, pcaCentroid, covariance);
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eigen_solver(covariance, Eigen::ComputeEigenvectors);
     Eigen::Matrix3f eigenVectorsPCA = eigen_solver.eigenvectors();
     
-    // Enforce right-handed coordinate system
+    // Enforce a right-handed basis.
     eigenVectorsPCA.col(2) = eigenVectorsPCA.col(0).cross(eigenVectorsPCA.col(1));
 
-    // 3. Transform point cloud to origin aligned with PCA axes
+    // Transform cloud into PCA-aligned local frame.
     Eigen::Matrix4f projectionTransform(Eigen::Matrix4f::Identity());
     projectionTransform.block<3,3>(0,0) = eigenVectorsPCA.transpose();
     projectionTransform.block<3,1>(0,3) = -1.f * (projectionTransform.block<3,3>(0,0) * pcaCentroid.head<3>());
@@ -185,7 +186,7 @@ OrientedBoundingBox SemanticObjectMapV5::compute_obb(pcl::PointCloud<pcl::PointX
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloudProjected(new pcl::PointCloud<pcl::PointXYZ>);
     pcl::transformPointCloud(*cloud, *cloudProjected, projectionTransform);
 
-    // 4. Find min/max in the local aligned space to get extents
+    // Read extents from axis-aligned bounds in local space.
     pcl::PointXYZ minPoint, maxPoint;
     pcl::getMinMax3D(*cloudProjected, minPoint, maxPoint);
 
@@ -213,7 +214,7 @@ std::array<std::array<float, 3>, 8> SemanticObjectMapV5::compute_obb_corners(con
     const float hy = 0.5f * obb.extents[1];
     const float hz = 0.5f * obb.extents[2];
 
-    // Keep the same ordering expected by downstream visualization/export scripts.
+    // Preserve corner ordering expected by downstream visualization and export.
     const std::array<Eigen::Vector3f, 8> local = {
         Eigen::Vector3f(-hx, -hy, -hz),
         Eigen::Vector3f(+hx, -hy, -hz),
@@ -237,7 +238,7 @@ float SemanticObjectMapV5::compute_obb_iou(
     pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
     pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2) 
 {
-    // Orientation-aware overlap proxy used in matching and map update logic.
+    // Orientation-aware overlap proxy used by association and duplicate checks.
     return oriented_overlap_ratio(points1, obb1, points2, obb2);
 }
 
@@ -284,7 +285,7 @@ void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {
     auto& obj = objects[map_id];
     if (obj.accumulated_points->points.size() < 20) return;
 
-    // DBSCAN equivalent using PCL EuclideanClusterExtraction
+    // Use Euclidean clustering and keep the dominant cluster only.
     pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
     tree->setInputCloud(obj.accumulated_points);
 
@@ -299,7 +300,7 @@ void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {
 
     if (cluster_indices.empty()) return;
 
-    // The first cluster is guaranteed to be the largest by PCL
+    // Cluster ordering is size-descending, so index 0 is the largest cluster.
     pcl::PointCloud<pcl::PointXYZ>::Ptr refined_cloud(new pcl::PointCloud<pcl::PointXYZ>);
     for (const auto& idx : cluster_indices[0].indices) {
         refined_cloud->points.push_back(obj.accumulated_points->points[idx]);
@@ -310,13 +311,11 @@ void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {
     refined_cloud->is_dense = true;
     
     obj.accumulated_points = refined_cloud;
-    obj.obb = compute_obb(obj.accumulated_points); // Recalculate OBB
+    obj.obb = compute_obb(obj.accumulated_points);
     obj.pose_map = obj.obb.center;
 }
 
-// ==========================================
-// 2. STATE MANAGEMENT & VOTING
-// ==========================================
+// State management and class consensus.
 
 long long SemanticObjectMapV5::stamp_to_ns(const builtin_interfaces::msg::Time& stamp) {
     return (static_cast<long long>(stamp.sec) * 1000000000LL) + stamp.nanosec;
@@ -355,7 +354,7 @@ std::string SemanticObjectMapV5::choose_consensus_class(
 
     int current_count = class_counts.count(current_name) ? class_counts.at(current_name) : 0;
     if (current_count >= min_class_votes_to_lock && best_score < (current_score + class_switch_margin)) {
-        return current_name; // Prevent rapid flipping
+        return current_name;
     }
     return best_name;
 }
@@ -382,9 +381,7 @@ void SemanticObjectMapV5::prune_stale_state(long long current_ns) {
     }
 }
 
-// ==========================================
-// 3. CORE UPDATE LOGIC
-// ==========================================
+// Core update logic.
 
 void SemanticObjectMapV5::update_object(
     const std::string& map_id, const std::string& object_name,
@@ -554,9 +551,7 @@ bool SemanticObjectMapV5::update_tentative(
     return true;
 }
 
-// ==========================================
-// 4. THE MATRIX (BIPARTITE MATCHING)
-// ==========================================
+// Batch update and bipartite association.
 
 void SemanticObjectMapV5::add_detections_batch(
     const std::vector<std::string>& object_names,
@@ -587,23 +582,21 @@ void SemanticObjectMapV5::add_detections_batch(
 
     std::vector<int> unmatched_indices;
 
-    // PHASE 1: Direct ID Routing (Trust the Tracker)
+    // First try direct tracker-to-map routing.
     for (size_t i = 0; i < points_cam_list.size(); ++i) {
         std::string t_id = tracker_ids[i];
         bool matched = false;
 
-        // Has this ID already been promoted to the map?
         if (track_to_map.count(t_id) && objects.count(track_to_map[t_id])) {
             std::string map_id = track_to_map[t_id];
             
-            // Safety Gate: Do not trust tracker if class suddenly flips
+            // Guard against class flips for reused tracker IDs.
             if (object_names[i] == objects[map_id].current_name) {
                 const std::vector<float> image_embedding_masked = embeddings_list_masked[i].has_value() ? embeddings_list_masked[i].value() : std::vector<float>{};
                 const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[i].has_value() ? embeddings_list_unmasked[i].value() : std::vector<float>{};
                 float similarity = 0.0f;
                 const auto& map_obj = objects[map_id];
                 if (!image_embedding_masked.empty() && !map_obj.image_embedding_masked.empty()) {
-                    // Compute image-to-image cosine similarity for object correspondence
                     similarity = compute_embedding_similarity(image_embedding_masked, map_obj.image_embedding_masked) * 100.0f;
                 }
                 update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding_masked, image_embedding_unmasked, current_ns, t_id);
@@ -619,7 +612,7 @@ void SemanticObjectMapV5::add_detections_batch(
 
     if (unmatched_indices.empty()) return;
 
-    // PHASE 2: Bipartite Matching for new/unmatched detections
+    // Associate remaining detections with map objects using Hungarian matching.
     std::vector<std::string> map_ids;
     for (const auto& pair : objects) map_ids.push_back(pair.first);
 
@@ -647,7 +640,6 @@ void SemanticObjectMapV5::add_detections_batch(
     int M = map_ids.size();
     std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, 0.0));
 
-    // Notice we removed w_dist from here because it is now computed dynamically below
     double w_sem = 1.5;
     double MAX_COST = 4.0;
     constexpr double kBlockedCost = 999.0;
@@ -664,15 +656,13 @@ void SemanticObjectMapV5::add_detections_batch(
         for (int j = 0; j < M; ++j) {
             auto& map_obj = objects[map_ids[j]];
 
-            // 1. Raw Distance
+            // Distance between detection center and object center.
             double dx = det_obb.center[0] - map_obj.pose_map[0];
             double dy = det_obb.center[1] - map_obj.pose_map[1];
             double dz = det_obb.center[2] - map_obj.pose_map[2];
             double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
             
-            // ==========================================
-            // SOTA: SCALE-AWARE DYNAMIC WEIGHTING
-            // ==========================================
+            // Scale-aware weighting keeps small objects strict and large objects permissive.
             float max_size_det = std::max({det_obb.extents[0], det_obb.extents[1], det_obb.extents[2]});
             float max_size_map = std::max({map_obj.obb.extents[0], map_obj.obb.extents[1], map_obj.obb.extents[2]});
             float max_size = std::max(max_size_det, max_size_map);
@@ -680,27 +670,26 @@ void SemanticObjectMapV5::add_detections_batch(
             double dynamic_w_dist = 1.0;
             double dynamic_w_iou = 2.0;
             if (max_size < 0.2f) {
-                // Small objects: strict distance penalty to keep them distinct
+                // Small objects are sensitive to drift.
                 dynamic_w_dist = 3.0; 
                 dynamic_w_iou = 2.0;
             } else if (max_size > 2.0f) {
-                // Large objects: loose distance penalty
+                // Large objects can tolerate wider centroid shifts.
                 dynamic_w_dist = 0.2;
                 dynamic_w_iou = 0.3;
             } else {
-                // Medium objects: linear interpolation
+                // Interpolate smoothly between the two regimes.
                 double ratio = (max_size - 0.2f) / 1.8f;
                 dynamic_w_dist = 3.0 - (2.8 * ratio);
                 dynamic_w_iou = 2.0 - (1.7 * ratio);
             }
 
-            // Dynamic Hard Gate: Max allowed shift is 1.5x the object's size (Minimum 40cm)
+            // Hard gate that rejects implausible jumps before running the optimizer.
             double dynamic_max_dist = std::max(0.4f, max_size * 1.2f);
             if (dist > dynamic_max_dist) {
                 costMatrix[i][j] = kBlockedCost;
                 continue;
             }
-            // ==========================================
 
             double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 3.0 : 0.0;
             const double cheap_cost = (dynamic_w_dist * dist) + class_penalty;
@@ -759,20 +748,18 @@ void SemanticObjectMapV5::add_detections_batch(
             double iou = compute_obb_iou(points_cam_list[det_idx], det_obb, map_obj.accumulated_points, map_obj.obb);
             double cost_sem = 1.0;
             if (embeddings_list_masked[det_idx].has_value() && !map_obj.image_embedding_masked.empty()) {
-                // Compute image-to-image cosine similarity: higher = better match = lower cost
                 float similarity = compute_embedding_similarity(embeddings_list_masked[det_idx].value(), map_obj.image_embedding_masked);
-                // Convert similarity [0, 1] to cost: lower similarity = higher cost
                 cost_sem = 1.0 - static_cast<double>(similarity);
             }
 
             double class_penalty = (object_names[det_idx] != map_obj.current_name) ? 3.0 : 0.0;
 
-            // 3. Final Cost Matrix computation
+            // Final combined assignment cost.
             costMatrix[i][j] = (dynamic_w_dist * dist) + (dynamic_w_iou * (1.0 - iou)) + (w_sem * cost_sem) + class_penalty;
         }
     }
 
-    // Solve using the imported Hungarian Algorithm C++ Library
+    // Solve assignment with Hungarian optimization.
     HungarianAlgorithm HungAlgo;
     std::vector<int> assignment;
     HungAlgo.Solve(costMatrix, assignment);
@@ -781,7 +768,6 @@ void SemanticObjectMapV5::add_detections_batch(
         int map_idx = assignment[i];
         int det_idx = unmatched_indices[i];
         
-        // If matched and the cost is under the maximum threshold
         if (map_idx >= 0 && costMatrix[i][map_idx] < MAX_COST) {
             std::string m_id = map_ids[map_idx];
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
@@ -789,14 +775,13 @@ void SemanticObjectMapV5::add_detections_batch(
             float similarity = 0.0f;
             const auto& map_obj = objects[m_id];
             if (!image_embedding_masked.empty() && !map_obj.image_embedding_masked.empty()) {
-                // Compute image-to-image cosine similarity for object correspondence
                 similarity = compute_embedding_similarity(image_embedding_masked, map_obj.image_embedding_masked) * 100.0f;
             }
             update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding_masked, image_embedding_unmasked, current_ns, tracker_ids[det_idx]);
             track_to_map[tracker_ids[det_idx]] = m_id;
             track_last_seen_ns[tracker_ids[det_idx]] = current_ns;
         } else {
-            // PHASE 3: Spawn New Tentative Tracks
+            // Unmatched detections are accumulated as tentative tracks.
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
             const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
             update_tentative(
@@ -836,13 +821,13 @@ void SemanticObjectMapV5::fuse_objects(const std::string& keep_id, const std::st
 void SemanticObjectMapV5::resolve_overlapping_duplicates() {
     if (objects.size() < 2) return;
 
-    // Store all IDs in a standard vector to safely iterate without invalidating iterators
+    // Copy keys first so merges can safely erase from the map.
     std::vector<std::string> ids;
     for (const auto& pair : objects) {
         ids.push_back(pair.first);
     }
 
-    // Use a set to keep track of objects that have been merged and should be ignored
+    // Track dropped IDs to skip them in the current pass.
     std::set<std::string> to_remove;
 
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -856,20 +841,18 @@ void SemanticObjectMapV5::resolve_overlapping_duplicates() {
             auto& obj_a = objects[id_a];
             auto& obj_b = objects[id_b];
 
-            // STRICT CONDITION 1: Only proceed if both objects share the exact same class name
+            // Merge candidates must agree on class label.
             if (obj_a.current_name != obj_b.current_name) {
                 continue;
             }
 
-            // Calculate the spatial overlap using your existing orientation-aware proxy
             float iou = oriented_overlap_ratio(
                 obj_a.accumulated_points, obj_a.obb,
                 obj_b.accumulated_points, obj_b.obb
             );
 
-            // STRICT CONDITION 2: Require a very high overlap (e.g., 80%) to trigger a merge
+            // Require very high overlap to avoid accidental merges.
             if (iou > 0.80f) {
-                // Keep the object that has a higher history of occurrences
                 std::string keep_id, drop_id;
                 if (obj_a.occurrences >= obj_b.occurrences) {
                     keep_id = id_a;
@@ -883,13 +866,10 @@ void SemanticObjectMapV5::resolve_overlapping_duplicates() {
                           << " into " << keep_id << " (Class: " << obj_a.current_name 
                           << ", IoU: " << iou << ")\n";
 
-                // Fuse the geometries and map properties
                 fuse_objects(keep_id, drop_id);
                 
-                // Mark the dropped ID so it is skipped in future iterations
                 to_remove.insert(drop_id);
 
-                // If the object from the outer loop was dropped, stop comparing it against others
                 if (drop_id == id_a) {
                     break;
                 }
@@ -904,38 +884,31 @@ void SemanticObjectMapV5::resolve_overlapping_duplicates() {
 void SemanticObjectMapV5::remove_wrong_detections() {
     if (objects.empty()) return;
 
-    // 1. Find the latest timestamp in the map to represent the "current time".
-    // This avoids needing to pass a ROS clock or external time parameter.
+    // Use the newest object timestamp as the reference "now".
     long long current_ns = 0;
     for (const auto& pair : objects) {
         current_ns = std::max(current_ns, pair.second.last_seen_ns);
     }
 
-    // 2. Define thresholds locally (you can move these to your .hpp file later if needed)
-    constexpr double kMaxAgeSec = 10.0;     // Object must be older than 10 seconds
-    constexpr int kMinOccurrences = 5;      // Object must have fewer than 5 occurrences
+    constexpr double kMaxAgeSec = 10.0;
+    constexpr int kMinOccurrences = 5;
 
     int removed_count = 0;
 
-    // 3. Safely iterate through the map and erase invalid objects
     for (auto it = objects.begin(); it != objects.end(); ) {
         
-        // Calculate the age of the object in seconds
         double age_sec = static_cast<double>(current_ns - it->second.first_seen_ns) / 1e9;
 
-        // Condition: Older than the time threshold AND fewer occurrences than the threshold
         if (age_sec > kMaxAgeSec && it->second.occurrences < kMinOccurrences) {
             
             std::cout << "[SemanticObjectMap] Removing wrong detection: " << it->first 
                       << " (Class: " << it->second.current_name 
                       << ", Age: " << age_sec << "s, Occurrences: " << it->second.occurrences << ")\n";
             
-            // erase() removes the element and safely returns an iterator to the next element
             it = objects.erase(it);
             removed_count++;
             
         } else {
-            // Move to the next element only if we didn't erase the current one
             ++it;
         }
     }
@@ -945,12 +918,9 @@ void SemanticObjectMapV5::remove_wrong_detections() {
     }
 }
 
-// ---------------------------------------------------------
-// Global Text Query & SigLIP Similarity
-// ---------------------------------------------------------
+// Goal text embedding and similarity scoring.
 
 void SemanticObjectMapV5::set_text_embedding(const std::vector<float>& emb, float scale, float bias) {
-    // Store the global goal
     goal_text_embedding_ = emb;
     logit_scale_ = scale;
     logit_bias_ = bias;
@@ -965,7 +935,6 @@ float SemanticObjectMapV5::get_goal_similarity(const std::string& map_id) const 
     const auto& img_emb_masked = it->second.image_embedding_masked;
     const auto& img_emb_unmasked = it->second.image_embedding_unmasked;
 
-    // 1. Compute Masked Score
     float score_masked = 0.0f;
     if (!img_emb_masked.empty()) {
         float dot_m = std::inner_product(img_emb_masked.begin(), img_emb_masked.end(), goal_text_embedding_.begin(), 0.0f);
@@ -974,7 +943,6 @@ float SemanticObjectMapV5::get_goal_similarity(const std::string& map_id) const 
         score_masked = (1.0f / (1.0f + std::exp(-clipped_m))) * 100.0f;
     }
 
-    // 2. Compute Unmasked Score
     float score_unmasked = 0.0f;
     if (!img_emb_unmasked.empty()) {
         float dot_u = std::inner_product(img_emb_unmasked.begin(), img_emb_unmasked.end(), goal_text_embedding_.begin(), 0.0f);
@@ -983,6 +951,6 @@ float SemanticObjectMapV5::get_goal_similarity(const std::string& map_id) const 
         score_unmasked = (1.0f / (1.0f + std::exp(-clipped_u))) * 100.0f;
     }
 
-    // 3. Blend exactly like the Python vision node (85% masked / 15% unmasked)
+    // Keep the same weighting behavior as the paired Python node.
     return (1.0f * score_masked) + (0.0f * score_unmasked);
 }
