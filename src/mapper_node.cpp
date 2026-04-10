@@ -28,9 +28,9 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
 
     // Declare node parameters.
     dm_topic_ = this->declare_parameter("detection_message", "/vision/detections");
-    map_frame_ = this->declare_parameter("map_frame", "camera_color_optical_frame");
+    map_frame_ = this->declare_parameter("map_frame", "map");
     camera_frame_ = this->declare_parameter("camera_frame", "camera_color_optical_frame");
-    output_dir_ = this->declare_parameter("output_dir", "/home/workspace/ros2_ws/src/yolo11_seg_bringup/config/");
+    output_dir_ = this->declare_parameter("output_dir", "/workspaces/ros2_ws/src/yolo11_seg_bringup/config/");
     output_map_file_ = this->declare_parameter("output_map_file", "map_v6.json");
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
@@ -39,7 +39,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     min_range_ = this->declare_parameter("min_range", 0.1f);
     max_range_ = this->declare_parameter("max_range", 3.0f);
     // Voxel filtering
-    do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", true);
+    do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", false);
     voxel_size_ = this->declare_parameter("voxel_size", 0.12f);
     min_point_count_ = this->declare_parameter("min_point_count", 4000.0f);
     max_point_count_ = this->declare_parameter("max_point_count", 30000.0f);
@@ -242,16 +242,16 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             // Adapt voxel size to raw cloud density.
             int num_raw_points = raw_cloud->points.size();
 
-            if (num_raw_points < min_point_count_) voxel_size = min_voxel_size_;
-            else if (num_raw_points > max_point_count_) voxel_size = max_voxel_size_;
+            if (num_raw_points < min_point_count_) voxel_size_ = min_voxel_size_;
+            else if (num_raw_points > max_point_count_) voxel_size_ = max_voxel_size_;
             else {
                 float scale = (static_cast<float>(num_raw_points) - min_point_count_) / (max_point_count_ - min_point_count_); // Linear interpolation for in between values
-                voxel_size = min_voxel_size_ + scale * (max_voxel_size_ - min_voxel_size_);
+                voxel_size_ = min_voxel_size_ + scale * (max_voxel_size_ - min_voxel_size_);
             }
             // Downsample cloud before clustering.
             pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
             voxel_filter.setInputCloud(raw_cloud);
-            voxel_filter.setLeafSize(voxel_size, voxel_size, voxel_size); 
+            voxel_filter.setLeafSize(voxel_size_, voxel_size_, voxel_size_); 
             voxel_filter.filter(*downsampled_cloud);
         } else {
             downsampled_cloud = raw_cloud;

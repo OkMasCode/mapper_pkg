@@ -110,6 +110,23 @@ private:
 
     double export_interval_;
     bool publish_stable_pointcloud_enabled_;
+
+    // Depth range filtering parameters.
+    float min_range_;
+    float max_range_;
+
+    // Voxel filtering parameters.
+    bool do_voxel_filtering_;
+    float voxel_size_;
+    float min_point_count_;
+    float max_point_count_;
+    float min_voxel_size_;
+    float max_voxel_size_;
+
+    // Euclidean clustering parameters.
+    float cluster_tolerance_;
+    int min_cluster_size_;
+    int max_cluster_size_;
     
     // Camera intrinsics from CameraInfo.
     double fx_, fy_, cx_, cy_;
