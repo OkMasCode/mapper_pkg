@@ -81,7 +81,7 @@ A high-performance **ROS 2 C++ node** that builds and maintains a **real-time 3D
 | `map_frame` | `map` | Target TF frame for the global map |
 | `camera_frame` | `camera_color_optical_frame` | Camera optical frame ID |
 | `output_dir` | (workspace path) | Directory for map export output |
-| `output_map_file` | `map_v6.json` | Filename for exported map |
+| `output_map_file` | `map_v6.json` | Filename for exported map (reserved for future file-based export on shutdown) |
 | `stable_pointcloud_topic` | `/vision/semantic_map_v5/points` | Topic for visualization point cloud |
 | `publish_stable_pointcloud` | `true` | Enable/disable point cloud publishing |
 | `viewer_enabled` | `true` | Enable/disable RViz visualization publisher |
