@@ -25,34 +25,70 @@ A high-performance **ROS 2 C++ node** that builds and maintains a **real-time 3D
 
 ## Architecture
 
+### Detailed Block Diagram (mapper internals)
+
 ```
-                          ┌───────────────────────┐
-  /camera/.../camera_info │   CameraInfo Sub      │ intrinsics (fx, fy, cx, cy)
-  ───────────────────────►│                       ├──────────────┐
-                          └───────────────────────┘              │
-                                                                 ▼
-  /vision/detections      ┌───────────────────────┐    ┌──────────────────────┐
-  (DetectedObjectV3Array) │  ApproximateTime Sync │    │  PointCloudMapper    │
-  ───────────────────────►│                       ├───►│  NodeV5              │
-  /camera/.../image_raw   │  (detections + depth) │    │                      │
-  (depth Image)           └───────────────────────┘    │  ┌────────────────┐  │
-  ───────────────────────►                             │  │ SemanticObject │  │
-                                                       │  │ MapV5          │  │
-  /vision/text_embedding  ┌───────────────────────┐    │  │                │  │
-  (Float32MultiArray)     │  Text Embedding Sub   │    │  │  - Tentative   │  │
-  ───────────────────────►│                       ├───►│  │    Tracks      │  │
-                          └───────────────────────┘    │  │  - Confirmed   │  │
-                                                       │  │    Objects     │  │
-                                                       │  │  - Hungarian   │  │
-                                                       │  │    Matching    │  │
-                                                       │  └────────────────┘  │
-                                                       │                      │
-                                                       │  Outputs:            │
-                                                       │  ├─► /vision/        │
-                                                       │  │   semantic_map_v5 │
-                                                       │  └─► /vision/        │
-                                                       │      .../points      │
-                                                       └──────────────────────┘
+Inputs
+  ┌─────────────────────────────────────────────┐
+  │ /camera/.../camera_info                     │
+  │  -> fx, fy, cx, cy                          │
+  └──────────────────────┬──────────────────────┘
+                         │
+  ┌──────────────────────▼──────────────────────┐
+  │ /vision/detections (DetectedObjectV3Array)  │
+  │ /camera/.../image_raw (depth)               │
+  │  -> ApproximateTime sync                    │
+  └──────────────────────┬──────────────────────┘
+                         │ synced callback
+                         ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ PointCloudMapperNodeV5                                                      │
+│                                                                              │
+│  (A) Depth preprocessing                                                    │
+│      - CV conversion (16UC1 mm -> 32FC1 m)                                 │
+│      - bilateralFilter(depth, d=5, sigmaColor=0.05, sigmaSpace=5)          │
+│      - TF lookup map <- camera                                              │
+│                                                                              │
+│  (B) Per-detection geometry extraction                                      │
+│      - decode mask                                                          │
+│      - masked depth back-projection (pinhole)                              │
+│      - adaptive voxel + adaptive SOR                                        │
+│      - reject tiny clouds (<4 pts)                                          │
+│      - transform cloud camera->map                                          │
+│                                                                              │
+│  (C) Batch handoff                                                          │
+│      add_detections_batch(names, track_ids, conf, cloud_map, embeddings)   │
+└───────────────────────────────┬──────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ SemanticObjectMapV5                                                         │
+│                                                                              │
+│  1) Fast route: tracker_id -> map_id (if bound and class-consistent)        │
+│  2) For remaining detections: Hungarian association                          │
+│      Stage-1 prune: distance + class penalty (Top-K keep)                   │
+│      Stage-2 full score: dist + OBB overlap + embedding + class penalty     │
+│      Global one-to-one assignment via Hungarian                              │
+│      Accept only if cost < MAX_COST                                          │
+│  3) Matched => update_object: geometry fuse + OBB recompute + voting/EMA    │
+│  4) Unmatched => tentative tracks; promote when maturity constraints pass    │
+│  5) Cleanup: duplicate merge (same class, overlap > 0.80), stale pruning     │
+└───────────────────────────────┬──────────────────────────────────────────────┘
+                                │
+                                ▼
+Outputs
+  ┌─────────────────────────────────────────────┐
+  │ /vision/semantic_map_v5                     │
+  │  - id, class, pose, OBB, embeddings, score │
+  └─────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────┐
+  │ /vision/semantic_map_v5/points              │
+  │  - colored XYZRGB fused map cloud           │
+  └─────────────────────────────────────────────┘
+
+Side input (goal relevance):
+  /vision/text_embedding -> set_text_embedding(embedding, logit_scale, bias)
+  used in get_goal_similarity() during publish
 ```
 
 ## Subscribed Topics
@@ -114,28 +150,206 @@ A high-performance **ROS 2 C++ node** that builds and maintains a **real-time 3D
 
 ## Processing Pipeline
 
-Each synchronized callback executes the following steps:
+Each synchronized callback executes:
 
-1. **Depth conversion** — the raw depth image is converted to a `CV_32FC1` matrix in meters.
-2. **TF lookup** — the camera-to-map transform is obtained via TF2 for the current timestamp.
-3. **Per-detection processing** (for each detection in the frame):
-   1. Decode the binary segmentation mask.
-   2. Back-project masked depth pixels to a 3D point cloud using camera intrinsics.
-   3. Optionally apply adaptive voxel downsampling.
-   4. Run Euclidean clustering and keep only the largest cluster.
-   5. Transform the cleaned cloud into the map frame.
-4. **Batch association** — all surviving detections are passed to `SemanticObjectMapV5::add_detections_batch()`:
-   1. Detections with a known tracker-ID binding are routed directly to their map object.
-   2. Remaining detections enter the Hungarian matching stage:
-      - A cost matrix is built against all map objects using centroid distance, class penalty, OBB IoU, and embedding similarity.
-      - A two-stage screening first prunes by cheap distance+class cost (top-K), then computes full scores only on survivors.
-      - The Hungarian algorithm solves the global assignment.
-   3. Matched detections update their map objects (geometry fusion, OBB recomputation, class voting, embedding fusion).
-   4. Unmatched detections enter or update tentative tracks; tracks meeting the confirmation criteria are promoted to the persistent map.
-5. **Geometry refinement** — each object's accumulated cloud is re-clustered to remove noise.
-6. **Duplicate resolution** — same-class objects with OBB overlap > 80% are merged.
-7. **Stale pruning** — objects older than 10 s with fewer than 5 observations are removed.
-8. **Publishing** — the semantic map message and optional colored point cloud are published.
+1. Convert depth to meters and smooth depth.
+2. Get TF transform (`source_frame -> map_frame`) for current depth timestamp.
+3. For each detection:
+   - decode mask
+   - project mask pixels to 3D cloud
+   - adaptive voxel/SOR filtering
+   - reject if too few points
+   - transform cloud to map frame
+4. Batch association and state update in `add_detections_batch()`:
+   - direct tracker binding update when valid
+   - Hungarian association for unresolved detections
+   - matched -> update confirmed objects
+   - unmatched -> update/create tentative tracks, promote when mature
+5. Post-update map maintenance:
+   - geometry refinement per object
+   - duplicate resolution
+   - stale object pruning
+6. Publish semantic map and optional colored map cloud.
+
+## Pipeline Math (Detailed)
+
+Notation: pixel `(u,v)`, depth `z`, camera intrinsics `(fx, fy, cx, cy)`, 3D point `p=[x,y,z]^T`.
+
+### 1) Depth conversion and smoothing
+
+- If depth image is `16UC1` (mm):  
+  `z_meters = z_raw * 0.001`
+- Otherwise depth is already `32FC1` meters.
+- 2D bilateral filtering is applied:
+  - diameter `d = 5`
+  - `sigmaColor = 0.05` (meters)
+  - `sigmaSpace = 5.0` (pixels)
+
+### 2) Pinhole back-projection (mask -> 3D cloud)
+
+For every masked pixel with valid depth (`min_range <= z <= max_range`):
+
+- `x = (u - cx) * z / fx`
+- `y = (v - cy) * z / fy`
+- `z = z`
+
+This creates per-detection cloud `C_det` in camera frame.
+
+### 3) Adaptive filtering
+
+Given raw point count `n`:
+
+- For `n <= min_point_count`: use minimum voxel/SOR settings.
+- For `n >= max_point_count`: use maximum voxel/SOR settings.
+- Else linear interpolation:
+  - `t = (n - min_point_count) / (max_point_count - min_point_count)`
+  - `voxel_size = min_voxel_size + t*(max_voxel_size - min_voxel_size)`
+  - `sor_mean_k = min_sor_k + t*(max_sor_k - min_sor_k)`
+  - `sor_stddev = min_sor_stddev + t*(max_sor_stddev - min_sor_stddev)`
+
+Then:
+- optional VoxelGrid downsampling
+- optional StatisticalOutlierRemoval
+
+### 4) Camera->map transform
+
+With TF transform `(R, t)` from source frame to map:
+
+- `p_map = R * p_cam + t`
+
+Quaternion from TF is normalized before building `R`.
+
+### 5) OBB (oriented bounding box) from PCA
+
+For cloud `C`:
+
+1. centroid `c = mean(C)`
+2. covariance `Σ = cov(C)`
+3. eigenvectors `E = [e1 e2 e3]` from `Σ`
+4. enforce right-handed basis: `e3 = e1 × e2`
+5. project points into local PCA frame:
+   - `p_local = E^T (p - c)`
+6. local min/max bounds -> extents:
+   - `extent_x = max_x - min_x`, similarly for `y,z`
+
+Stored OBB:
+- center `c`
+- extents `(L,W,H)`
+- rotation matrix `E`
+
+### 6) Overlap proxy (used as IoU-like term)
+
+`compute_obb_iou()` uses orientation-aware overlap ratio:
+
+- sample up to ~50 points from each cloud
+- compute:
+  - `r12 = fraction(points1 inside obb2)`
+  - `r21 = fraction(points2 inside obb1)`
+- overlap proxy:
+  - `overlap = clamp(0.5*(r12 + r21), 0, 1)`
+
+### 7) Embedding normalization and similarity
+
+For embedding vector `e`:
+
+- normalize: `e_hat = e / ||e||_2`
+
+Image-image similarity:
+
+- `sim = dot(e_hat1, e_hat2)` (cosine because normalized)
+- clamped to `[0,1]`
+
+Running embedding fusion:
+
+- `fused = normalize((cw*cur + nw*new)/(cw+nw))`
+
+where `cw` and `nw` are effective counts.
+
+### 8) Association math (Hungarian stage)
+
+For each unmatched detection `i` and map object `j`:
+
+1. centroid distance:
+   - `dist_ij = ||center_det_i - center_map_j||_2`
+
+2. class mismatch penalty:
+   - `penalty_ij = max_class_penalty` if classes differ, else `0`
+
+3. scale-aware weights (object-size dependent):
+   - let `s = max(max_extent_det, max_extent_map)`
+   - if `s < small_size`: use `(w_dist_small, w_iou_small)`
+   - if `s > large_size`: use `(w_dist_large, w_iou_large)`
+   - else interpolate linearly with ratio  
+     `r = (s-small_size)/(large_size-small_size)`
+
+4. hard distance gate:
+   - `dist_ij <= max(0.4, 1.2*s)` else blocked
+
+5. Stage-1 cheap score (for Top-K shortlist):
+   - `cheap_ij = w_dist(s)*dist_ij + penalty_ij`
+
+6. Stage-2 full score (only shortlisted pairs):
+   - `iou_ij = overlap_proxy(det_i, map_j)`
+   - `cost_sem_ij = 1 - sim_embedding_ij` (or `1` if embedding unavailable)
+   - Final:
+     - `cost_ij = w_dist(s)*dist_ij + w_iou(s)*(1 - iou_ij) + w_sem*cost_sem_ij + penalty_ij`
+
+Hungarian solves global one-to-one assignment on `cost_ij`.
+
+Acceptance rule:
+- assigned and `cost_ij < MAX_COST` (default `4.5`) -> match accepted
+- otherwise detection goes to tentative pipeline
+
+### 9) Tentative track promotion logic
+
+A tentative track is promoted only when all are true:
+
+- `hits >= confirmation_min_hits` (default `5`)
+- `age_sec >= confirmation_min_age_sec` (default `1.0`)
+- `confidence_max >= min_confidence_for_promotion` (default `0.6`)
+- `avg_conf = confidence_sum/hits >= min_avg_confidence_for_promotion` (default `0.55`)
+
+Also, low-confidence inputs are rejected before tentative update:
+- `confidence >= min_input_confidence` (default `0.55`)
+
+### 10) Confirmed object update equations
+
+For accepted detection:
+
+1. geometry fusion:
+   - concatenate old/new cloud
+   - optional ICP alignment
+   - adaptive SOR + adaptive voxel
+2. recompute OBB and pose from fused cloud
+3. class evidence:
+   - `class_count[name] += 1`
+   - `class_conf_sum[name] += confidence`
+4. class score per label:
+   - `score(name) = class_count_weight*count(name) + class_confidence_weight*avg_conf(name)`
+5. hysteresis lock:
+   - if current label has enough votes and challenger margin is small, keep current class
+6. confidence EMA:
+   - `conf_ema = (1-α)*conf_ema + α*confidence` with `α = confidence_ema_alpha` (default `0.20`)
+
+### 11) Duplicate merge and stale pruning
+
+- Duplicate merge condition:
+  - same class AND overlap proxy `> 0.80`
+- Wrong/stale object removal condition:
+  - `age_sec > kMaxAgeSec` (default `20.0`)
+  - AND `occurrences < kMinOccurrences` (default `50`)
+- Tentative and track-binding stale state are also pruned with TTL windows.
+
+### 12) Goal similarity scoring math (published per object)
+
+Given text embedding `t`, object image embedding `e`, logit scale `s`, bias `b`:
+
+1. `dot = <e, t>`
+2. `logits = dot*s + b`
+3. `logits_clipped = clamp(logits, -60, 60)`
+4. `score = sigmoid(logits_clipped) * 100`
+
+Current output uses masked embedding score (`1.0*masked + 0.0*unmasked`).
 
 ## Dependencies
 
