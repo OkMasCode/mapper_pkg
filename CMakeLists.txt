@@ -16,6 +16,7 @@ find_package(message_filters REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
@@ -82,6 +83,5 @@ install(TARGETS mapper_node
 install(DIRECTORY include/
   DESTINATION include
 )
-
 
 ament_package()

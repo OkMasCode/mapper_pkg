@@ -1,6 +1,5 @@
 #include "mapper_pkg/semantic_object_map.hpp"
 #include "mapper_pkg/Hungarian.h"
-
 #include <iostream>
 #include <numeric>
 #include <cmath>
@@ -8,10 +7,13 @@
 #include <optional>
 #include <array>
 #include <set>
-
+#include <sstream>
+#include <iomanip>
+#include <limits>
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
-
+#include <pcl/registration/icp.h>
+#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/common/centroid.h>
 #include <pcl/common/transforms.h>
 #include <pcl/common/common.h>
@@ -44,17 +46,48 @@ inline bool point_inside_obb(const pcl::PointXYZ& p, const OrientedBoundingBox& 
     if (!obb_has_valid_shape(obb)) {
         return false;
     }
-
     const Eigen::Matrix3f R = rotation_from_obb(obb);
     const Eigen::Vector3f c = center_from_obb(obb);
     const Eigen::Vector3f w(p.x, p.y, p.z);
     const Eigen::Vector3f local = R.transpose() * (w - c);
-
     const float hx = 0.5f * obb.extents[0] + eps;
     const float hy = 0.5f * obb.extents[1] + eps;
     const float hz = 0.5f * obb.extents[2] + eps;
-
     return std::fabs(local.x()) <= hx && std::fabs(local.y()) <= hy && std::fabs(local.z()) <= hz;
+}
+
+inline void log_detection_fate(
+    const char* stage,
+    const std::string& track_id,
+    const std::string& class_name,
+    float confidence,
+    const std::string& extra = "")
+{
+    std::ostringstream oss;
+    oss << "[SemanticObjectMap][" << stage << "]"
+        << " track=" << track_id
+        << " class='" << class_name << "'"
+        << " conf=" << std::fixed << std::setprecision(3) << confidence;
+    if (!extra.empty()) {
+        oss << ' ' << extra;
+    }
+    std::cout << oss.str() << "\n";
+}
+
+inline void log_map_fate(
+    const char* stage,
+    const std::string& map_id,
+    const std::string& class_name,
+    const std::string& extra = "")
+{
+    std::ostringstream oss;
+    oss << "[SemanticObjectMap][" << stage << "]"
+        << " map_id=" << map_id
+        << " class='" << class_name << "'";
+    if (!extra.empty()) {
+        oss << ' ' << extra;
+    }
+    std::cout << oss.str() << "\n";
 }
 
 } // namespace
@@ -110,33 +143,93 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr SemanticObjectMapV5::fuse_geometry(
     pcl::PointCloud<pcl::PointXYZ>::Ptr old_points, 
     pcl::PointCloud<pcl::PointXYZ>::Ptr new_points) 
 {
-    // Simple fusion by concatenation followed by voxel downsampling to reduce duplicates and noise.
     pcl::PointCloud<pcl::PointXYZ>::Ptr combined(new pcl::PointCloud<pcl::PointXYZ>());
     
-    if (old_points && !old_points->empty()) *combined += *old_points;
-    if (new_points && !new_points->empty()) *combined += *new_points;
+    if (!old_points || old_points->empty()) return new_points;
+    if (!new_points || new_points->empty()) return old_points;
 
-    if (combined->empty()) return combined;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_new(new pcl::PointCloud<pcl::PointXYZ>());
+
+    if (enable_icp_fusion_) {
+    // ---------------------------------------------------------
+    // STEP 1: Alignment (ICP)
+    // Align the new points to the existing old points
+    // ---------------------------------------------------------
+        pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
+        icp.setInputSource(new_points);
+        icp.setInputTarget(old_points);
+    
+        // Crucial: Set a maximum distance to prevent it from matching 
+        // points that are completely unrelated (e.g., 5cm)
+        icp.setMaxCorrespondenceDistance(0.2); 
+        icp.setMaximumIterations(20);
+
+    
+        icp.align(*aligned_new);
+        // If ICP fails to find a good alignment, we skip fusion to avoid corrupting the map
+        if (!icp.hasConverged()) {
+            // Handle failure (e.g., log a warning and return old points)
+            return old_points; 
+        }
+    } else {
+        *aligned_new = *new_points;
+    }
+
+    // Simple fusion by concatenation followed by voxel downsampling to reduce duplicates and noise.
+    *combined = *old_points;
+    *combined += *aligned_new;
 
     // Adaptive voxelization
     int num_combined = combined->points.size();
 
     if (num_combined <= min_point_count) {
         voxel_size = min_voxel_size;
+        sor_mean_k = min_sor_k;
+        sor_stddev_mul_thresh = min_sor_stddev_mul_thresh;
     } else if (num_combined >= max_point_count) {
         voxel_size = max_voxel_size;
+        sor_mean_k = max_sor_k;
+        sor_stddev_mul_thresh = max_sor_stddev_mul_thresh;
     } else {
         const float t = static_cast<float>(num_combined - min_point_count) /
                         static_cast<float>(max_point_count - min_point_count);
         voxel_size = min_voxel_size + ((max_voxel_size - min_voxel_size) * t);
+        sor_mean_k = static_cast<int>(min_sor_k + ((max_sor_k - min_sor_k) * t));
+        sor_stddev_mul_thresh = min_sor_stddev_mul_thresh + ((max_sor_stddev_mul_thresh - min_sor_stddev_mul_thresh) * t);
     }
-    
-    // Downsample to reduce duplicate points after fusion.
+
     pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZ>());
-    pcl::VoxelGrid<pcl::PointXYZ> grid;
-    grid.setInputCloud(combined);
-    grid.setLeafSize(voxel_size, voxel_size, voxel_size);
-    grid.filter(*downsampled);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cleaned_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+
+    // ---------------------------------------------------------
+    // STEP 4: Statistical Outlier Removal (Cleanup)
+    // Removes noisy "floating" points generated by sensor error
+    // ---------------------------------------------------------
+    
+
+    if (enable_statistical_outlier_removal) {
+        pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+        sor.setInputCloud(combined);
+        sor.setMeanK(sor_mean_k);             // Look at 50 neighbors
+        sor.setStddevMulThresh(sor_stddev_mul_thresh);  // Remove points further than 1 standard dev from the mean distance
+        sor.filter(*cleaned_cloud);
+    } else {
+        *cleaned_cloud = *combined;
+    }
+
+    if (enable_voxel_filtering) {
+        // ---------------------------------------------------------
+        // STEP 2: Voxel Grid Downsampling (Duplication Reduction)
+        // Reduces the number of points by merging nearby points into voxels.
+        // ---------------------------------------------------------
+        
+        pcl::VoxelGrid<pcl::PointXYZ> grid;
+        grid.setInputCloud(cleaned_cloud);
+        grid.setLeafSize(voxel_size, voxel_size, voxel_size);
+        grid.filter(*downsampled);
+    } else {
+        *downsampled = *cleaned_cloud;
+    }
     
     return downsampled;
 }
@@ -265,25 +358,54 @@ void SemanticObjectMapV5::refine_object_geometry(const std::string& map_id) {
     auto& obj = objects[map_id];
     if (obj.accumulated_points->points.size() < static_cast<size_t>(refine_min_point_count)) return;
 
-    // Use Euclidean clustering and keep the dominant cluster only.
-    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-    tree->setInputCloud(obj.accumulated_points);
-
-    std::vector<pcl::PointIndices> cluster_indices;
-    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-    ec.setClusterTolerance(refine_cluster_tolerance);
-    ec.setMinClusterSize(refine_min_cluster_size);
-    ec.setMaxClusterSize(refine_max_cluster_size);
-    ec.setSearchMethod(tree);
-    ec.setInputCloud(obj.accumulated_points);
-    ec.extract(cluster_indices);
-
-    if (cluster_indices.empty()) return;
-
-    // Cluster ordering is size-descending, so index 0 is the largest cluster.
     pcl::PointCloud<pcl::PointXYZ>::Ptr refined_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-    for (const auto& idx : cluster_indices[0].indices) {
-        refined_cloud->points.push_back(obj.accumulated_points->points[idx]);
+    // Use Euclidean clustering and keep the dominant cluster only.
+    if (enable_clustering_refinement) {
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        tree->setInputCloud(obj.accumulated_points);
+
+        std::vector<pcl::PointIndices> cluster_indices;
+        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+        ec.setClusterTolerance(refine_cluster_tolerance);
+        ec.setMinClusterSize(refine_min_cluster_size);
+        ec.setMaxClusterSize(refine_max_cluster_size);
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(obj.accumulated_points);
+        ec.extract(cluster_indices);
+
+        if (cluster_indices.empty()) return;
+
+        // Cluster ordering is size-descending, so index 0 is the largest cluster.
+        for (const auto& idx : cluster_indices[0].indices) {
+            refined_cloud->points.push_back(obj.accumulated_points->points[idx]);
+        }
+    } else {
+        refined_cloud = obj.accumulated_points;
+    }
+
+    int num_combined = refined_cloud->points.size();
+
+    if (num_combined <= min_point_count) {
+        sor_mean_k = min_sor_k;
+        sor_stddev_mul_thresh = min_sor_stddev_mul_thresh;
+    } else if (num_combined >= max_point_count) {
+        sor_mean_k = max_sor_k;
+        sor_stddev_mul_thresh = max_sor_stddev_mul_thresh;
+    } else {
+        const float t = static_cast<float>(num_combined - min_point_count) /
+                        static_cast<float>(max_point_count - min_point_count);
+        sor_mean_k = static_cast<int>(min_sor_k + ((max_sor_k - min_sor_k) * t));
+        sor_stddev_mul_thresh = min_sor_stddev_mul_thresh + ((max_sor_stddev_mul_thresh - min_sor_stddev_mul_thresh) * t);
+    }
+
+    if (enable_sor_refinement) {
+        pcl::StatisticalOutlierRemoval<pcl::PointXYZ> sor;
+        sor.setInputCloud(refined_cloud);
+        sor.setMeanK(sor_mean_k);
+        sor.setStddevMulThresh(1.3f);
+        sor.filter(*refined_cloud);
+    } else {
+        refined_cloud = obj.accumulated_points;
     }
     
     refined_cloud->width = refined_cloud->points.size();
@@ -346,6 +468,12 @@ void SemanticObjectMapV5::prune_stale_state(long long current_ns) {
 
     for (auto it = tentative_tracks.begin(); it != tentative_tracks.end(); ) {
         if (current_ns - it->second.last_seen_ns > stale_tentative_ns) {
+            log_detection_fate(
+                "drop_stale_tentative",
+                it->first,
+                it->second.class_name,
+                it->second.confidence_max,
+                "reason=stale_timeout");
             it = tentative_tracks.erase(it);
         } else {
             ++it;
@@ -354,6 +482,13 @@ void SemanticObjectMapV5::prune_stale_state(long long current_ns) {
 
     for (auto it = track_last_seen_ns.begin(); it != track_last_seen_ns.end(); ) {
         if (current_ns - it->second > stale_binding_ns) {
+            const std::string map_id = track_to_map.count(it->first) ? track_to_map[it->first] : std::string{};
+            const std::string class_name = (!map_id.empty() && objects.count(map_id)) ? objects[map_id].current_name : std::string("<unknown>");
+            log_map_fate(
+                "drop_stale_binding",
+                map_id.empty() ? std::string("<unbound>") : map_id,
+                class_name,
+                std::string("track=") + it->first + " reason=stale_timeout");
             track_to_map.erase(it->first);
             it = track_last_seen_ns.erase(it);
         } else {
@@ -438,14 +573,14 @@ bool SemanticObjectMapV5::update_tentative(
 {
     // Ignore detections that cannot contribute usable geometry.
     if (!points_map || points_map->empty()) {
-        std::cout << "[SemanticObjectMap] tentative skip: empty cloud for track=" << tracker_id << "\n";
+        log_detection_fate("drop_empty_cloud", tracker_id, object_name, confidence, "reason=empty_geometry");
         return false;
     }
 
     // Confidence gate keeps low-quality detections out of tentative state.
     if (confidence < min_input_confidence) {
-        std::cout << "[SemanticObjectMap] tentative skip: low confidence=" << confidence
-                  << " threshold=" << min_input_confidence << " track=" << tracker_id << "\n";
+        log_detection_fate("drop_low_confidence", tracker_id, object_name, confidence,
+            std::string("threshold=") + std::to_string(min_input_confidence));
         return false;
     }
 
@@ -472,8 +607,7 @@ bool SemanticObjectMapV5::update_tentative(
         }
         tentative_tracks[tracker_id] = t;
 
-        std::cout << "[SemanticObjectMap] tentative create: track=" << tracker_id
-                  << " class=" << object_name << " conf=" << confidence << "\n";
+        log_detection_fate("tentative_create", tracker_id, object_name, confidence, "hits=1");
         return false;
     }
 
@@ -507,9 +641,11 @@ bool SemanticObjectMapV5::update_tentative(
         avg_conf >= min_avg_confidence_for_promotion;
 
     if (!promote) {
-        std::cout << "[SemanticObjectMap] tentative update: track=" << tracker_id
-                  << " hits=" << t.hits << " age=" << age_sec
-                  << " avg_conf=" << avg_conf << " max_conf=" << t.confidence_max << "\n";
+        log_detection_fate("tentative_update", tracker_id, object_name, confidence,
+            std::string("hits=") + std::to_string(t.hits) +
+            " age_sec=" + std::to_string(age_sec) +
+            " avg_conf=" + std::to_string(avg_conf) +
+            " max_conf=" + std::to_string(t.confidence_max));
         return false;
     }
 
@@ -545,9 +681,8 @@ bool SemanticObjectMapV5::update_tentative(
     track_last_seen_ns[tracker_id] = current_ns;
     tentative_tracks.erase(it);
 
-    std::cout << "[SemanticObjectMap] promote tentative -> map: track=" << tracker_id
-              << " map_id=" << map_id << " class=" << obj.current_name
-              << " hits=" << obj.occurrences << "\n";
+    log_map_fate("promote_tentative", map_id, obj.current_name,
+        std::string("track=") + tracker_id + " hits=" + std::to_string(obj.occurrences));
     return true;
 }
 
@@ -564,7 +699,17 @@ void SemanticObjectMapV5::add_detections_batch(
     const std::string& camera_frame,
     const std::string& map_frame)
 {
-    if (points_cam_list.empty()) return;
+    std::cout << "[SemanticObjectMap] batch start: n=" << points_cam_list.size()
+              << " names=" << object_names.size()
+              << " tracks=" << tracker_ids.size()
+              << " conf=" << confidences.size()
+              << " masked_emb=" << embeddings_list_masked.size()
+              << " unmasked_emb=" << embeddings_list_unmasked.size() << "\n";
+
+    if (points_cam_list.empty()) {
+        std::cout << "[SemanticObjectMap] batch skip: empty input list\n";
+        return;
+    }
 
     if (object_names.size() != points_cam_list.size() ||
         tracker_ids.size() != points_cam_list.size() ||
@@ -580,12 +725,18 @@ void SemanticObjectMapV5::add_detections_batch(
     long long current_ns = stamp_to_ns(stamp);
     prune_stale_state(current_ns);
 
+    std::cout << "[SemanticObjectMap] batch state: objects=" << objects.size()
+              << " tentative=" << tentative_tracks.size()
+              << " bindings=" << track_to_map.size() << "\n";
+
     std::vector<int> unmatched_indices;
 
     // First try direct tracker-to-map routing.
     for (size_t i = 0; i < points_cam_list.size(); ++i) {
         std::string t_id = tracker_ids[i];
         bool matched = false;
+
+        log_detection_fate("enter", t_id, object_names[i], confidences[i], std::string("batch_idx=") + std::to_string(i));
         
         if (track_to_map.count(t_id) && objects.count(track_to_map[t_id])) {
             //I already have the traker ID in the map
@@ -601,9 +752,18 @@ void SemanticObjectMapV5::add_detections_batch(
                 if (!image_embedding_masked.empty() && !map_obj.image_embedding_masked.empty()) {
                     similarity = compute_embedding_similarity(image_embedding_masked, map_obj.image_embedding_masked) * 100.0f;
                 }
+                log_map_fate("merge_direct", map_id, objects[map_id].current_name,
+                    std::string("track=") + t_id +
+                    " det_class='" + object_names[i] +
+                    "' conf=" + std::to_string(confidences[i]) +
+                    " emb_similarity=" + std::to_string(similarity) +
+                    " reason=existing_track_binding_and_class_match");
                 update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding_masked, image_embedding_unmasked, current_ns, t_id);
                 track_last_seen_ns[t_id] = current_ns;
                 matched = true;
+            } else {
+                log_detection_fate("reject_direct", t_id, object_names[i], confidences[i],
+                    std::string("reason=class_mismatch map_id=") + map_id + " map_class='" + objects[map_id].current_name + "'");
             }
         } 
 
@@ -615,17 +775,19 @@ void SemanticObjectMapV5::add_detections_batch(
 
     if (unmatched_indices.empty()) return;
 
+    std::cout << "[SemanticObjectMap] batch unmatched after direct routing: "
+              << unmatched_indices.size() << "\n";
+
     // Associate remaining detections with map objects using Hungarian matching.
     std::vector<std::string> map_ids;
     for (const auto& pair : objects) map_ids.push_back(pair.first);
 
     if (map_ids.empty()) {
     // No existing map objects to associate with, so route all unmatched detections to tentative tracks.
-        std::cout << "[SemanticObjectMap] map empty: routing " << unmatched_indices.size()
-                  << " detections to tentative tracks\n";
         for (int det_idx : unmatched_indices) {
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
             const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
+            log_detection_fate("route_tentative", tracker_ids[det_idx], object_names[det_idx], confidences[det_idx], "reason=map_empty");
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
@@ -637,23 +799,33 @@ void SemanticObjectMapV5::add_detections_batch(
                 current_ns,
                 map_frame.empty() ? camera_frame : map_frame);
         }
+            std::cout << "[SemanticObjectMap] batch complete via tentative routing: objects=" << objects.size()
+                  << " tentative=" << tentative_tracks.size()
+                  << " bindings=" << track_to_map.size() << "\n";
         return; 
     }
 
     // N: unmatched detections, M: currently tracked map objects.
     int N = unmatched_indices.size();
     int M = map_ids.size();
-    std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, 0.0));
+            std::cout << "[SemanticObjectMap] association stage: unmatched=" << N
+                  << " map_objects=" << M << "\n";
+    std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, kBlockedCost));
+    const double nan_value = std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::vector<double>> distMatrix(N, std::vector<double>(M, nan_value));
+    std::vector<std::vector<double>> iouMatrix(N, std::vector<double>(M, nan_value));
+    std::vector<std::vector<double>> semCostMatrix(N, std::vector<double>(M, nan_value));
+    std::vector<std::vector<double>> classPenaltyMatrix(N, std::vector<double>(M, nan_value));
+    std::vector<std::vector<double>> wDistMatrix(N, std::vector<double>(M, nan_value));
+    std::vector<std::vector<double>> wIouMatrix(N, std::vector<double>(M, nan_value));
     for (int i = 0; i < N; ++i) {
         int det_idx = unmatched_indices[i];
         // Compute detection geometry once and reuse it for all candidate objects.
         OrientedBoundingBox det_obb = compute_obb(points_cam_list[det_idx]);
 
         if (!obb_has_valid_shape(det_obb)) {
-            std::cout << "[SemanticObjectMap] batch skip geom: invalid detection OBB det_idx=" << det_idx
-                      << " track=" << tracker_ids[det_idx]
-                      << " points=" << (points_cam_list[det_idx] ? points_cam_list[det_idx]->size() : 0)
-                      << "\n";
+            log_detection_fate("drop_invalid_geom", tracker_ids[det_idx], object_names[det_idx], confidences[det_idx],
+                std::string("reason=invalid_detection_obb points=") + std::to_string(points_cam_list[det_idx] ? points_cam_list[det_idx]->size() : 0));
             continue;
         }
 
@@ -726,6 +898,7 @@ void SemanticObjectMapV5::add_detections_batch(
         }
 
         if (cheap_candidates.empty()) {
+            log_detection_fate("no_candidates", tracker_ids[det_idx], object_names[det_idx], confidences[det_idx], "reason=all_blocked_before_hungarian");
             continue;
         }
 
@@ -799,6 +972,12 @@ void SemanticObjectMapV5::add_detections_batch(
 
             // Final combined assignment cost.
             costMatrix[i][j] = (dynamic_w_dist * dist) + (dynamic_w_iou * (1.0 - iou)) + (w_sem * cost_sem) + class_penalty;
+            distMatrix[i][j] = dist;
+            iouMatrix[i][j] = iou;
+            semCostMatrix[i][j] = cost_sem;
+            classPenaltyMatrix[i][j] = class_penalty;
+            wDistMatrix[i][j] = dynamic_w_dist;
+            wIouMatrix[i][j] = dynamic_w_iou;
         }
     }
 
@@ -806,6 +985,8 @@ void SemanticObjectMapV5::add_detections_batch(
     HungarianAlgorithm HungAlgo;
     std::vector<int> assignment;
     HungAlgo.Solve(costMatrix, assignment);
+
+    std::cout << "[SemanticObjectMap] hungarian solved for N=" << N << " M=" << M << "\n";
 
     for (int i = 0; i < N; ++i) {
         int map_idx = assignment[i];
@@ -821,6 +1002,18 @@ void SemanticObjectMapV5::add_detections_batch(
             if (!image_embedding_masked.empty() && !map_obj.image_embedding_masked.empty()) {
                 similarity = compute_embedding_similarity(image_embedding_masked, map_obj.image_embedding_masked) * 100.0f;
             }
+            log_map_fate("associate", m_id, map_obj.current_name,
+                std::string("track=") + tracker_ids[det_idx] +
+                " det_class='" + object_names[det_idx] +
+                " cost=" + std::to_string(costMatrix[i][map_idx]) +
+                " dist=" + std::to_string(distMatrix[i][map_idx]) +
+                " iou=" + std::to_string(iouMatrix[i][map_idx]) +
+                " sem_cost=" + std::to_string(semCostMatrix[i][map_idx]) +
+                " class_penalty=" + std::to_string(classPenaltyMatrix[i][map_idx]) +
+                " w_dist=" + std::to_string(wDistMatrix[i][map_idx]) +
+                " w_iou=" + std::to_string(wIouMatrix[i][map_idx]) +
+                " w_sem=" + std::to_string(w_sem) +
+                " max_cost=" + std::to_string(MAX_COST));
             // Update matched stable object and refresh tracker binding.
             update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding_masked, image_embedding_unmasked, current_ns, tracker_ids[det_idx]);
             track_to_map[tracker_ids[det_idx]] = m_id;
@@ -829,6 +1022,7 @@ void SemanticObjectMapV5::add_detections_batch(
             // Rejected/unassigned detections keep accumulating as tentative tracks.
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
             const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
+            log_detection_fate("route_tentative", tracker_ids[det_idx], object_names[det_idx], confidences[det_idx], "reason=hungarian_rejected");
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
@@ -853,6 +1047,9 @@ void SemanticObjectMapV5::fuse_objects(const std::string& keep_id, const std::st
 
     auto& keep = objects[keep_id];
     auto& drop = objects[drop_id];
+
+    log_map_fate("merge_duplicate", keep_id, keep.current_name,
+        std::string("drop_id=") + drop_id + " drop_class='" + drop.current_name + "' reason=overlap_cleanup");
 
     keep.accumulated_points = fuse_geometry(keep.accumulated_points, drop.accumulated_points);
     keep.obb = compute_obb(keep.accumulated_points);
@@ -907,10 +1104,6 @@ void SemanticObjectMapV5::resolve_overlapping_duplicates() {
                     drop_id = id_a;
                 }
 
-                std::cout << "[SemanticObjectMap] Merging duplicate " << drop_id 
-                          << " into " << keep_id << " (Class: " << obj_a.current_name 
-                          << ", IoU: " << iou << ")\n";
-
                 fuse_objects(keep_id, drop_id);
                 
                 to_remove.insert(drop_id);
@@ -922,8 +1115,8 @@ void SemanticObjectMapV5::resolve_overlapping_duplicates() {
         }
     }
     
-    std::cout << "[SemanticObjectMap] Overlap resolution complete. Removed " 
-              << to_remove.size() << " strict duplicates.\n";
+    std::cout << "[SemanticObjectMap][cleanup] removed_strict_duplicates=" 
+              << to_remove.size() << "\n";
 }
 
 void SemanticObjectMapV5::remove_wrong_detections() {
@@ -935,9 +1128,6 @@ void SemanticObjectMapV5::remove_wrong_detections() {
         current_ns = std::max(current_ns, pair.second.last_seen_ns);
     }
 
-    constexpr double kMaxAgeSec = 10.0;
-    constexpr int kMinOccurrences = 5;
-
     int removed_count = 0;
 
     for (auto it = objects.begin(); it != objects.end(); ) {
@@ -946,9 +1136,8 @@ void SemanticObjectMapV5::remove_wrong_detections() {
 
         if (age_sec > kMaxAgeSec && it->second.occurrences < kMinOccurrences) {
             
-            std::cout << "[SemanticObjectMap] Removing wrong detection: " << it->first 
-                      << " (Class: " << it->second.current_name 
-                      << ", Age: " << age_sec << "s, Occurrences: " << it->second.occurrences << ")\n";
+            log_map_fate("drop_wrong_detection", it->first, it->second.current_name,
+                std::string("age_sec=") + std::to_string(age_sec) + " occurrences=" + std::to_string(it->second.occurrences));
             
             it = objects.erase(it);
             removed_count++;
@@ -959,7 +1148,7 @@ void SemanticObjectMapV5::remove_wrong_detections() {
     }
 
     if (removed_count > 0) {
-        std::cout << "[SemanticObjectMap] Removed " << removed_count << " wrong detections.\n";
+        std::cout << "[SemanticObjectMap][cleanup] removed_wrong_detections=" << removed_count << "\n";
     }
 }
 

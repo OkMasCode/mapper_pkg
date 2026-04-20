@@ -8,10 +8,8 @@
 #include <tuple>
 #include <optional>
 #include <array>
-
 #include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
@@ -27,27 +25,22 @@ struct OrientedBoundingBox {
 };
 
 // Persistent object entry stored in the semantic map.
-
 struct MapObject {
     std::string map_id;
     std::string frame;
-    builtin_interfaces::msg::Time timestamp;
-    
+    builtin_interfaces::msg::Time timestamp;    
     // Geometry accumulated over multiple observations.
     pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
     OrientedBoundingBox obb; 
-    
     // Lifecycle statistics used for stability and pruning.
     int occurrences = 0;
     long long first_seen_ns = 0;
     long long last_seen_ns = 0;
-    
     // Running class evidence for consensus naming.
     std::string current_name;
     std::unordered_map<std::string, float> class_votes;
     std::unordered_map<std::string, int> class_counts;
     std::unordered_map<std::string, float> class_conf_sums;
-    
     // Similarity and embedding history used for association and goal scoring.
     float similarity = 0.0f;
     float confidence_ema = 0.0f;
@@ -55,7 +48,6 @@ struct MapObject {
     std::vector<float> image_embedding_unmasked;
     float embedding_confidence_max = -1.0f;
     std::string source_track_id;
-
     // Cached poses reused by message publishing paths.
     std::vector<float> pose_cam{0.0f, 0.0f, 0.0f};
     std::vector<float> pose_map{0.0f, 0.0f, 0.0f};
@@ -66,15 +58,12 @@ struct TentativeTrack {
     std::string track_id;
     std::string frame;
     builtin_interfaces::msg::Time timestamp;
-    
     // Geometry collected while the track is still tentative.
     pcl::PointCloud<pcl::PointXYZ>::Ptr accumulated_points;
-    
     // Promotion counters and timestamps.
     int hits = 0;
     long long first_seen_ns = 0;
     long long last_seen_ns = 0;
-    
     // Class and embedding evidence collected before promotion.
     std::string class_name;
     float confidence_max = 0.0f;
@@ -85,29 +74,25 @@ struct TentativeTrack {
 };
 
 // Core mapper that associates detections, tracks object state, and maintains geometry.
-
 class SemanticObjectMapV5 {
     public:
     SemanticObjectMapV5();
     ~SemanticObjectMapV5() = default;
-
     // Main object stores.
     std::unordered_map<std::string, MapObject> objects;
     std::unordered_map<std::string, TentativeTrack> tentative_tracks;
-    
     // Tracker binding tables.
     std::unordered_map<std::string, std::string> track_to_map;
     std::unordered_map<std::string, long long> track_last_seen_ns;
-
     // Update tentative parameters
     float min_input_confidence = 0.55f;
-    int confirmation_min_hits = 6;
-    float confirmation_min_age_sec = 0.8f;
+    int confirmation_min_hits = 5;
+    float confirmation_min_age_sec = 1.0f;
     float min_confidence_for_promotion = 0.6f;
     float min_avg_confidence_for_promotion = 0.55f;
     // stale pruning parameters
-    float tentative_max_stale_sec = 2.0f;
-    float binding_ttl_sec = 4.0f;
+    float tentative_max_stale_sec = 5.0f;
+    float binding_ttl_sec = 10.0f;
     float confidence_ema_alpha = 0.20f;
     // class consensus parameters
     float class_count_weight = 1.0f;
@@ -115,29 +100,43 @@ class SemanticObjectMapV5 {
     float class_switch_margin = 0.75f;
     int min_class_votes_to_lock = 4;
     // voxel filtering
-    float voxel_size = 0.01f;
-    float min_point_count = 3000.0f;
-    float max_point_count = 80000.0f;
-    float min_voxel_size = 0.01f;
-    float max_voxel_size = 0.055f;
+    float voxel_size = 0.04f;
+    float min_point_count = 800.0f;
+    float max_point_count = 9000.0f;
+    float min_voxel_size = 0.02f;
+    float max_voxel_size = 0.2f;
+    int sor_mean_k = 50;
+    int min_sor_k = 20;
+    int max_sor_k = 120;
+    float sor_stddev_mul_thresh = 1.0f;
+    float min_sor_stddev_mul_thresh = 1.5f;
+    float max_sor_stddev_mul_thresh = 1.0f;
+    bool enable_voxel_filtering = true;
+    bool enable_icp_fusion_ = false;
+    bool enable_statistical_outlier_removal = true;
     // geometry refinement parameters
     int refine_min_point_count = 20;
     double refine_cluster_tolerance = 0.06;
     int refine_min_cluster_size = 70;
     int refine_max_cluster_size = 25000;
+    bool enable_clustering_refinement = false;
+    bool enable_sor_refinement = false;
     // scoring parameters
-    double w_sem = 1.5;
-    double MAX_COST = 4.0;
+    double w_sem = 3.5;
+    double MAX_COST = 4.5;
     double kBlockedCost = 999.0;
     int kTopKPerDetection = 3;
     double max_class_penalty = 3.0;
     // Dynamic association weights based on object size.
-    float association_small_object_max_size = 0.2f;
+    float association_small_object_max_size = 0.05f;
     float association_large_object_min_size = 2.0f;
-    double association_small_object_dist_weight = 3.0;
-    double association_small_object_iou_weight = 2.0;
+    double association_small_object_dist_weight = 5.0;
+    double association_small_object_iou_weight = 4.0;
     double association_large_object_dist_weight = 0.2;
     double association_large_object_iou_weight = 0.3;
+    // Remove wrong detections parameters
+    double kMaxAgeSec = 20.0;
+    int kMinOccurrences = 50;
 
 
     // Adds a synchronized batch of detections and updates object memory.
