@@ -21,6 +21,10 @@ find_package(cv_bridge REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(yolo11_seg_interfaces REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(grid_map_ros REQUIRED)
+find_package(grid_map_msgs REQUIRED)
+find_package(grid_map_core REQUIRED)
 
 # OpenCV
 find_package(OpenCV REQUIRED)
@@ -52,6 +56,7 @@ target_include_directories(mapper_node PUBLIC
   $<INSTALL_INTERFACE:include>
   ${EIGEN3_INCLUDE_DIRS}
   ${PCL_INCLUDE_DIRS}
+  /opt/ros/humble/include   # <-- ADD THIS workaround for the FunctorsPlugin error
 )
 
 ament_target_dependencies(mapper_node
@@ -67,6 +72,9 @@ ament_target_dependencies(mapper_node
   pcl_conversions
   pcl_ros
   yolo11_seg_interfaces
+  grid_map_ros       # <-- ADD THIS
+  grid_map_msgs      # <-- ADD THIS
+  grid_map_core      # <-- ADD THIS (Crucial for the Eigen fix)
 )
 
 target_link_libraries(mapper_node 
@@ -82,6 +90,35 @@ install(TARGETS mapper_node
 
 install(DIRECTORY include/
   DESTINATION include
+)
+
+add_executable(sem_mapper
+  src/sem_mapper.cpp
+)
+
+target_include_directories(sem_mapper PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+ament_target_dependencies(sem_mapper
+  rclcpp
+  nav_msgs
+  sensor_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  yolo11_seg_interfaces
+  grid_map_ros
+  grid_map_msgs
+  grid_map_core
+)
+
+target_include_directories(sem_mapper PUBLIC /opt/ros/humble/include)
+
+install(TARGETS sem_mapper
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()
