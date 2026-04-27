@@ -49,7 +49,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     std::string depth_topic = this->declare_parameter("depth_topic", "/jackal/sensors/camera_0/aligned_depth_to_color/image");
     std::string cm_info_topic = this->declare_parameter("camera_info_topic", "/jackal/sensors/camera_0/aligned_depth_to_color/camera_info");
     std::string text_emb_topic = this->declare_parameter("vision_topic", "/vision/text_embedding");
-    output_dir_ = this->declare_parameter("output_dir", "/workspaces/ros2_ws/src/yolo11_seg_bringup/config/");
+    output_dir_ = this->declare_parameter("output_dir", "/home/workspace/ros2_ws/src/yolo11_seg_bringup/config/");
     output_map_file_ = this->declare_parameter("output_map_file", "map_v6.json");
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
