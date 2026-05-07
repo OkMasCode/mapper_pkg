@@ -19,7 +19,7 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 // OpenCV and cv_bridge for image conversion.
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/opencv.hpp>
 // Message filters for synchronized streams.
 #include <message_filters/subscriber.h>

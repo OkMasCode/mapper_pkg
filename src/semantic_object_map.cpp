@@ -558,6 +558,10 @@ void SemanticObjectMapV5::update_object(
     if (entry.frame.empty()) {
         entry.frame = "map";
     }
+    
+    std::cout << "    [MAP UPDATE] map_id=" << map_id << " class='" << entry.current_name 
+              << "' occurrences=" << entry.occurrences << " conf=" << entry.confidence_ema 
+              << " geometry_points=" << entry.accumulated_points->size() << "\n";
 }
 
 bool SemanticObjectMapV5::update_tentative(
@@ -608,6 +612,8 @@ bool SemanticObjectMapV5::update_tentative(
         tentative_tracks[tracker_id] = t;
 
         log_detection_fate("tentative_create", tracker_id, object_name, confidence, "hits=1");
+        std::cout << "    [NEW TENTATIVE] track=" << tracker_id << " class='" << object_name 
+                  << "' conf=" << confidence << " points=" << points_map->size() << "\n";
         return false;
     }
 
@@ -646,6 +652,8 @@ bool SemanticObjectMapV5::update_tentative(
             " age_sec=" + std::to_string(age_sec) +
             " avg_conf=" + std::to_string(avg_conf) +
             " max_conf=" + std::to_string(t.confidence_max));
+        std::cout << "    [UPDATE TENTATIVE] track=" << tracker_id << " hits=" << t.hits 
+                  << " age=" << age_sec << "s avg_conf=" << avg_conf << " (not ready for promotion)\n";
         return false;
     }
 
@@ -683,6 +691,10 @@ bool SemanticObjectMapV5::update_tentative(
 
     log_map_fate("promote_tentative", map_id, obj.current_name,
         std::string("track=") + tracker_id + " hits=" + std::to_string(obj.occurrences));
+    std::cout << "    >>> PROMOTED TO MAP <<<\n"
+              << "        new_map_id=" << map_id << " class='" << obj.current_name 
+              << "' from_track=" << tracker_id << " hits=" << t.hits 
+              << " age=" << age_sec << "s avg_conf=" << avg_conf << "\n";
     return true;
 }
 
@@ -699,15 +711,12 @@ void SemanticObjectMapV5::add_detections_batch(
     const std::string& camera_frame,
     const std::string& map_frame)
 {
-    std::cout << "[SemanticObjectMap] batch start: n=" << points_cam_list.size()
-              << " names=" << object_names.size()
-              << " tracks=" << tracker_ids.size()
-              << " conf=" << confidences.size()
-              << " masked_emb=" << embeddings_list_masked.size()
-              << " unmasked_emb=" << embeddings_list_unmasked.size() << "\n";
+    std::cout << "\n[BATCH] >>> Starting batch association: " << points_cam_list.size() 
+              << " detections, current_map_objects=" << objects.size() 
+              << ", tentative_tracks=" << tentative_tracks.size() << "\n";
 
     if (points_cam_list.empty()) {
-        std::cout << "[SemanticObjectMap] batch skip: empty input list\n";
+        std::cout << "[BATCH] Empty input list, skipping\n";
         return;
     }
 
@@ -716,16 +725,14 @@ void SemanticObjectMapV5::add_detections_batch(
         confidences.size() != points_cam_list.size() ||
         embeddings_list_masked.size() != points_cam_list.size() ||
         embeddings_list_unmasked.size() != points_cam_list.size()) {
-        std::cout << "[SemanticObjectMap] batch skip: size mismatch names=" << object_names.size()
-                  << " tracks=" << tracker_ids.size() << " conf=" << confidences.size()
-                  << " points=" << points_cam_list.size() << " embeddings=" << embeddings_list_masked.size() << "\n";
+        std::cout << "[BATCH] Size mismatch error!\n";
         return;
     }
 
     long long current_ns = stamp_to_ns(stamp);
     prune_stale_state(current_ns);
 
-    std::cout << "[SemanticObjectMap] batch state: objects=" << objects.size()
+    std::cout << "[BATCH] state: objects=" << objects.size()
               << " tentative=" << tentative_tracks.size()
               << " bindings=" << track_to_map.size() << "\n";
 
@@ -758,6 +765,8 @@ void SemanticObjectMapV5::add_detections_batch(
                     "' conf=" + std::to_string(confidences[i]) +
                     " emb_similarity=" + std::to_string(similarity) +
                     " reason=existing_track_binding_and_class_match");
+                std::cout << "  [ADDED TO MAP] track=" << t_id << " -> map_id=" << map_id 
+                          << " class='" << object_names[i] << "' conf=" << confidences[i] << "\n";
                 update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding_masked, image_embedding_unmasked, current_ns, t_id);
                 track_last_seen_ns[t_id] = current_ns;
                 matched = true;
@@ -784,10 +793,13 @@ void SemanticObjectMapV5::add_detections_batch(
 
     if (map_ids.empty()) {
     // No existing map objects to associate with, so route all unmatched detections to tentative tracks.
+        std::cout << "[BATCH] no map objects exist; routing " << unmatched_indices.size() << " unmatched detections to tentative\n";
         for (int det_idx : unmatched_indices) {
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
             const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
             log_detection_fate("route_tentative", tracker_ids[det_idx], object_names[det_idx], confidences[det_idx], "reason=map_empty");
+            std::cout << "  [TENTATIVE] track=" << tracker_ids[det_idx] << " class='" << object_names[det_idx] 
+                      << "' conf=" << confidences[det_idx] << "\n";
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
@@ -799,17 +811,16 @@ void SemanticObjectMapV5::add_detections_batch(
                 current_ns,
                 map_frame.empty() ? camera_frame : map_frame);
         }
-            std::cout << "[SemanticObjectMap] batch complete via tentative routing: objects=" << objects.size()
-                  << " tentative=" << tentative_tracks.size()
-                  << " bindings=" << track_to_map.size() << "\n";
+        std::cout << "[BATCH] complete via tentative routing: objects=" << objects.size()
+              << " tentative=" << tentative_tracks.size()
+              << " bindings=" << track_to_map.size() << "\n";
         return; 
     }
 
     // N: unmatched detections, M: currently tracked map objects.
     int N = unmatched_indices.size();
     int M = map_ids.size();
-            std::cout << "[SemanticObjectMap] association stage: unmatched=" << N
-                  << " map_objects=" << M << "\n";
+    std::cout << "[BATCH] Hungarian matching: " << N << " unmatched detections vs " << M << " map objects\n";
     std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, kBlockedCost));
     const double nan_value = std::numeric_limits<double>::quiet_NaN();
     std::vector<std::vector<double>> distMatrix(N, std::vector<double>(M, nan_value));
@@ -1036,9 +1047,9 @@ void SemanticObjectMapV5::add_detections_batch(
         }
     }
 
-    std::cout << "[SemanticObjectMap] batch complete: objects=" << objects.size()
+    std::cout << "[BATCH] complete: map_objects=" << objects.size()
               << " tentative=" << tentative_tracks.size()
-              << " bindings=" << track_to_map.size() << "\n";
+              << " bindings=" << track_to_map.size() << "\n\n";
 }
 
 void SemanticObjectMapV5::fuse_objects(const std::string& keep_id, const std::string& drop_id) {
