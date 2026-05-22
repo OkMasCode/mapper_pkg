@@ -60,19 +60,19 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     max_range_ = this->declare_parameter("max_range", 3.0f);
     // Voxel filtering
     do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", true);
-    voxel_size_ = this->declare_parameter("voxel_size", 0.05f);
-    min_point_count_ = this->declare_parameter("min_point_count", 5000.0f);
-    max_point_count_ = this->declare_parameter("max_point_count", 12000.0f);
-    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.01f);
-    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.3f);
+    voxel_size_ = this->declare_parameter("voxel_size", 0.04f);
+    min_point_count_ = this->declare_parameter("min_point_count", 800.0f);
+    max_point_count_ = this->declare_parameter("max_point_count", 9000.0f);
+    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.02f);
+    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.08f);
     // Statistical outlier removal
     do_sor_ = this->declare_parameter("do_sor_", true);
-    sor_mean_k_ = this->declare_parameter("sor_mean_k", 100);
-    min_sor_k_ = this->declare_parameter("min_sor_k", 10);
-    max_sor_k_ = this->declare_parameter("max_sor_k", 80);
+    sor_mean_k_ = this->declare_parameter("sor_mean_k", 50);
+    min_sor_k_ = this->declare_parameter("min_sor_k", 20);
+    max_sor_k_ = this->declare_parameter("max_sor_k", 120);
     sor_stddev_mul_thresh_ = this->declare_parameter("sor_stddev_mul_thresh", 1.0f);
-    min_sor_stddev_mul_thresh_ = this->declare_parameter("min_sor_stddev_mul_thresh", 0.6f);
-    max_sor_stddev_mul_thresh_ = this->declare_parameter("max_sor_stddev_mul_thresh", 0.6f);
+    min_sor_stddev_mul_thresh_ = this->declare_parameter("min_sor_stddev_mul_thresh", 1.0f);
+    max_sor_stddev_mul_thresh_ = this->declare_parameter("max_sor_stddev_mul_thresh", 1.0f);
     // Initialize semantic mapper logic.
     semantic_map_ = std::make_unique<SemanticObjectMapV5>();
     // Initialize camera intrinsic state.
@@ -80,6 +80,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     intrinsics_ready_ = false;
     // Initialize timing window state.
     last_timing_print_ = std::chrono::steady_clock::now();
+    last_sync_callback_time_ = last_timing_print_;
     // Initialize TF interfaces.
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -126,7 +127,7 @@ void PointCloudMapperNodeV5::camera_info_cb(const sensor_msgs::msg::CameraInfo::
 
 void PointCloudMapperNodeV5::text_embedding_cb(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(mutex_);
-    RCLCPP_INFO(this->get_logger(),
+    RCLCPP_DEBUG(this->get_logger(),
         "[mapper_node_v5:text_embedding] received vector size=%zu", msg->data.size());
     // Expect embedding values followed by scale and bias (last two elements of the vector).
     if (msg->data.size() > 2) {
@@ -134,7 +135,7 @@ void PointCloudMapperNodeV5::text_embedding_cb(const std_msgs::msg::Float32Multi
         float scale = msg->data[msg->data.size() - 2];
         std::vector<float> emb(msg->data.begin(), msg->data.end() - 2);
         semantic_map_->set_text_embedding(emb, scale, bias);
-        RCLCPP_INFO(this->get_logger(),
+        RCLCPP_DEBUG(this->get_logger(),
             "[mapper_node_v5:text_embedding] applied embedding_len=%zu scale=%.3f bias=%.3f",
             emb.size(), scale, bias);
     } else {
@@ -148,8 +149,14 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     const sensor_msgs::msg::Image::ConstSharedPtr depth_msg) 
 {
     auto t_total_start = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(mutex_);
-    RCLCPP_INFO(this->get_logger(),
+    last_sync_callback_time_ = t_total_start;
+    sync_callback_count_++;
+    auto t_lock_wait_start = t_total_start;
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto t_lock_wait_end = std::chrono::steady_clock::now();
+    timing_lock_wait_.total_time_ms += std::chrono::duration<double, std::milli>(t_lock_wait_end - t_lock_wait_start).count();
+    timing_lock_wait_.count++;
+    RCLCPP_DEBUG(this->get_logger(),
         "=== NEW DETECTION FRAME RECEIVED === frame_detections=%zu depth_frame=%s mask_frame=%s",
         mask_msg->detections.size(),
         depth_msg->header.frame_id.c_str(),
@@ -190,7 +197,8 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     // Replace the original noisy depth map with the smoothed version
     depth_m = smoothed_depth;
     auto t_depth_end = std::chrono::steady_clock::now();
-    timing_depth_conversion_.total_time_ms += std::chrono::duration<double, std::milli>(t_depth_end - t_depth_start).count();
+    const double frame_depth_ms = std::chrono::duration<double, std::milli>(t_depth_end - t_depth_start).count();
+    timing_depth_conversion_.total_time_ms += frame_depth_ms;
     timing_depth_conversion_.count++;
     // Generate transform matrix for mapping depth points into the global map frame.
     const std::string source_frame = depth_msg->header.frame_id.empty() ? camera_frame_ : depth_msg->header.frame_id;
@@ -230,17 +238,20 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     std::vector<std::optional<std::vector<float>>> embeddings_list_masked;
     std::vector<std::optional<std::vector<float>>> embeddings_list_unmasked;
     int accepted_detections = 0;
+    double frame_extract_total_ms = 0.0;
+    double frame_filter_total_ms = 0.0;
+    double frame_tf_total_ms = 0.0;
     // Process each detection and build a map-frame batch.
     for (size_t det_index = 0; det_index < mask_msg->detections.size(); ++det_index) {
         const auto& det = mask_msg->detections[det_index];
         const std::string det_tag = format_detection_trace(det_index, det, "enter");
-        RCLCPP_INFO(this->get_logger(), 
+        RCLCPP_DEBUG(this->get_logger(), 
             "  [DET %zu/%zu] id=%s class='%s' conf=%.3f", 
             det_index + 1, mask_msg->detections.size(),
             det_tag.c_str(), det.class_name.c_str(), det.confidence);
         
         if (det.mask.width == 0 || det.mask.height == 0) {
-            RCLCPP_INFO(this->get_logger(), "    -> DROPPED: no mask image");
+            RCLCPP_WARN(this->get_logger(), "    -> DROPPED: no mask image");
             continue;
         }
         auto t_extract_start = std::chrono::steady_clock::now();
@@ -252,10 +263,12 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         }
         auto raw_cloud = get_points_in_mask(depth_m, cv_mask);
         auto t_extract_end = std::chrono::steady_clock::now();
-        timing_point_extraction_.total_time_ms += std::chrono::duration<double, std::milli>(t_extract_end - t_extract_start).count();
+        const double frame_extract_ms = std::chrono::duration<double, std::milli>(t_extract_end - t_extract_start).count();
+        timing_point_extraction_.total_time_ms += frame_extract_ms;
         timing_point_extraction_.count++;
+        frame_extract_total_ms += frame_extract_ms;
         if (raw_cloud->points.size() < 4) {
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "    -> DROPPED: raw cloud too small (points=%zu)",
                 raw_cloud->points.size());
             continue;
@@ -312,10 +325,15 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         clean_cloud->height = 1;
         clean_cloud->is_dense = true;
         auto t_filter_end = std::chrono::steady_clock::now();
-        timing_filtering_.total_time_ms += std::chrono::duration<double, std::milli>(t_filter_end - t_filter_start).count();
+        const double frame_filter_ms = std::chrono::duration<double, std::milli>(t_filter_end - t_filter_start).count();
+        timing_filtering_.total_time_ms += frame_filter_ms;
         timing_filtering_.count++;
+        frame_filter_total_ms += frame_filter_ms;
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "[mapper_node_v5:filter] raw_points=%zu clean_points=%zu filter_ms=%.2f",
+            raw_cloud->points.size(), clean_cloud->points.size(), frame_filter_ms);
         if (clean_cloud->points.size() < 4) {
-            RCLCPP_INFO(this->get_logger(),
+            RCLCPP_WARN(this->get_logger(),
                 "    -> DROPPED: clean cloud too small (points=%zu)",
                 clean_cloud->points.size());
             continue;
@@ -329,8 +347,10 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             pcl::transformPointCloud(*clean_cloud, *cloud_map, tf_source_to_map);
         }
         auto t_tf_end = std::chrono::steady_clock::now();
-        timing_transformation_.total_time_ms += std::chrono::duration<double, std::milli>(t_tf_end - t_tf_start).count();
+        const double frame_tf_ms = std::chrono::duration<double, std::milli>(t_tf_end - t_tf_start).count();
+        timing_transformation_.total_time_ms += frame_tf_ms;
         timing_transformation_.count++;
+        frame_tf_total_ms += frame_tf_ms;
         // Append detection data for batch association.
         object_names.push_back(det.class_name);
         tracker_ids.push_back(std::to_string(det.instance_id));
@@ -347,12 +367,12 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             embeddings_list_unmasked.emplace_back(std::nullopt);
         }
         accepted_detections++;
-        RCLCPP_INFO(this->get_logger(),
+        RCLCPP_DEBUG(this->get_logger(),
             "    -> ACCEPTED: geometry_points=%zu, queued for map association",
             clean_cloud->points.size());
     }
     detections_accepted_total_ += accepted_detections;
-    RCLCPP_INFO(this->get_logger(),
+    RCLCPP_DEBUG(this->get_logger(),
         "=== BATCH SUMMARY === frame_detections=%d accepted=%d total_seen=%d total_accepted=%d",
         static_cast<int>(mask_msg->detections.size()), accepted_detections, 
         detections_seen_total_, detections_accepted_total_);
@@ -360,7 +380,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     // Pass the prepared batch into semantic association logic.
     if (!points_cam_list.empty()) {
         auto t_batch_start = std::chrono::steady_clock::now();
-        RCLCPP_INFO(this->get_logger(),
+        RCLCPP_DEBUG(this->get_logger(),
             ">>> PROCESSING BATCH: %zu detections -> semantic map association (current objects: %zu, tentative: %zu)",
             points_cam_list.size(), semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
         semantic_map_->add_detections_batch(
@@ -368,48 +388,112 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             mask_msg->header.stamp, camera_frame_, map_frame_
         );
         auto t_batch_end = std::chrono::steady_clock::now();
-        timing_batch_addition_.total_time_ms += std::chrono::duration<double, std::milli>(t_batch_end - t_batch_start).count();
+        const double frame_batch_ms = std::chrono::duration<double, std::milli>(t_batch_end - t_batch_start).count();
+        timing_batch_addition_.total_time_ms += frame_batch_ms;
         timing_batch_addition_.count++;
-        RCLCPP_INFO(this->get_logger(),
+        RCLCPP_DEBUG(this->get_logger(),
             "<<< BATCH PROCESSING COMPLETE: map objects now = %zu, tentative = %zu",
             semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
     } else {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
             "[mapper_node_v5:sync] no detections survived filtering in this frame");
     }
+    
+    // UNLOCK MUTEX: Release before expensive operations (refinement, cleanup, publishing)
+    // This allows new detection frames to be processed while we're doing intensive operations
+    lock.unlock();
+    
     auto t_pub_start = std::chrono::steady_clock::now();
+    double post_batch_accounted_ms = 0.0;
     try {
         // Refine each object cloud before duplicate cleanup.
-        RCLCPP_INFO(this->get_logger(),
+        RCLCPP_DEBUG(this->get_logger(),
             "[mapper_node_v5:publish] semantic_map objects=%zu tentative=%zu before refine",
             semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
+        auto t_refine_start = std::chrono::steady_clock::now();
         for (const auto& [map_id, entry] : semantic_map_->objects) {
             semantic_map_->refine_object_geometry(map_id);
         }
+        auto t_refine_end = std::chrono::steady_clock::now();
+        const double refine_ms = std::chrono::duration<double, std::milli>(t_refine_end - t_refine_start).count();
+        timing_refine_geometry_.total_time_ms += refine_ms;
+        timing_refine_geometry_.count++;
+        post_batch_accounted_ms += refine_ms;
+
         // Run duplicate and stale-object cleanup.
+        auto t_resolve_start = std::chrono::steady_clock::now();
         semantic_map_->resolve_overlapping_duplicates();
+        auto t_resolve_end = std::chrono::steady_clock::now();
+        const double resolve_ms = std::chrono::duration<double, std::milli>(t_resolve_end - t_resolve_start).count();
+        timing_duplicate_resolution_.total_time_ms += resolve_ms;
+        timing_duplicate_resolution_.count++;
+        post_batch_accounted_ms += resolve_ms;
+
+        auto t_cleanup_start = std::chrono::steady_clock::now();
         semantic_map_->remove_wrong_detections();
+        auto t_cleanup_end = std::chrono::steady_clock::now();
+        const double cleanup_ms = std::chrono::duration<double, std::milli>(t_cleanup_end - t_cleanup_start).count();
+        timing_wrong_detection_cleanup_.total_time_ms += cleanup_ms;
+        timing_wrong_detection_cleanup_.count++;
+        post_batch_accounted_ms += cleanup_ms;
+
+        auto t_publish_map_start = std::chrono::steady_clock::now();
         publish_semantic_map();
+        auto t_publish_map_end = std::chrono::steady_clock::now();
+        const double publish_map_ms = std::chrono::duration<double, std::milli>(t_publish_map_end - t_publish_map_start).count();
+        timing_publish_map_msg_.total_time_ms += publish_map_ms;
+        timing_publish_map_msg_.count++;
+        post_batch_accounted_ms += publish_map_ms;
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "Export/Merge error: %s", e.what());
     }
     if (publish_stable_pointcloud_enabled_) {
+        auto t_publish_cloud_start = std::chrono::steady_clock::now();
         publish_stable_pointcloud();
+        auto t_publish_cloud_end = std::chrono::steady_clock::now();
+        const double publish_cloud_ms = std::chrono::duration<double, std::milli>(t_publish_cloud_end - t_publish_cloud_start).count();
+        timing_publish_stable_cloud_.total_time_ms += publish_cloud_ms;
+        timing_publish_stable_cloud_.count++;
+        post_batch_accounted_ms += publish_cloud_ms;
     }
     auto t_pub_end = std::chrono::steady_clock::now();
-    timing_publishing_.total_time_ms += std::chrono::duration<double, std::milli>(t_pub_end - t_pub_start).count();
+    const double post_batch_total_ms = std::chrono::duration<double, std::milli>(t_pub_end - t_pub_start).count();
+    const double post_batch_other_ms = std::max(0.0, post_batch_total_ms - post_batch_accounted_ms);
+    timing_publishing_.total_time_ms += post_batch_other_ms;
     timing_publishing_.count++;
     // Update total timing and print periodic stats.
     auto t_total_end = std::chrono::steady_clock::now();
-    timing_total_.total_time_ms += std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+    const double frame_total_ms = std::chrono::duration<double, std::milli>(t_total_end - t_total_start).count();
+    timing_total_.total_time_ms += frame_total_ms;
     timing_total_.count++;
     frame_count_++;
+
+    // Emit a high-signal alert for slow frames with the stage breakdown.
+    constexpr double slow_frame_warn_ms = 150.0;
+    if (frame_total_ms >= slow_frame_warn_ms) {
+        RCLCPP_ERROR(this->get_logger(),
+            "[mapper_node_v5:slow_frame] frame_total_ms=%.3f detections=%zu accepted=%d objects=%zu tentative=%zu depth_ms=%.3f extract_ms=%.3f filter_ms=%.3f tf_ms=%.3f batch_ms=%.3f post_ms=%.3f",
+            frame_total_ms,
+            mask_msg->detections.size(),
+            accepted_detections,
+            semantic_map_ ? semantic_map_->objects.size() : 0,
+            semantic_map_ ? semantic_map_->tentative_tracks.size() : 0,
+            frame_depth_ms,
+            frame_extract_total_ms,
+            frame_filter_total_ms,
+            frame_tf_total_ms,
+            timing_batch_addition_.average(),
+            post_batch_total_ms);
+    }
+
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration<double>(now - last_timing_print_).count();
     if (elapsed >= 30.0) {
-        print_timing_stats();
+        print_timing_stats(true);
         last_timing_print_ = now;
     }
+    // Also print a non-resetting timing summary for this callback to help debug stalls.
+    print_timing_stats(false);
 }
 
 pcl::PointCloud<pcl::PointXYZ>::Ptr PointCloudMapperNodeV5::get_points_in_mask(
@@ -441,7 +525,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr PointCloudMapperNodeV5::get_points_in_mask(
 
 void PointCloudMapperNodeV5::publish_semantic_map() {
     if (semantic_map_->objects.empty()) {
-        RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:publish_map] skip: no objects");
+        RCLCPP_DEBUG(this->get_logger(), "[mapper_node_v5:publish_map] skip: no objects");
         return;
     }
     yolo11_seg_interfaces::msg::SemanticObjectArray msg;
@@ -504,7 +588,7 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
 
 void PointCloudMapperNodeV5::publish_stable_pointcloud() {
     if (semantic_map_->objects.empty()) {
-        RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:publish_cloud] skip: no objects");
+        RCLCPP_DEBUG(this->get_logger(), "[mapper_node_v5:publish_cloud] skip: no objects");
         return;
     }
     // Use XYZRGB cloud to publish per-object coloring.
@@ -525,7 +609,7 @@ void PointCloudMapperNodeV5::publish_stable_pointcloud() {
         }
     }
     if (colored_cloud->points.empty()) {
-        RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:publish_cloud] skip: empty colored cloud");
+        RCLCPP_DEBUG(this->get_logger(), "[mapper_node_v5:publish_cloud] skip: empty colored cloud");
         return;
     }
     colored_cloud->width = colored_cloud->points.size();
@@ -555,7 +639,7 @@ std::tuple<uint8_t, uint8_t, uint8_t> PointCloudMapperNodeV5::class_to_color_rgb
 
 void PointCloudMapperNodeV5::export_callback() {
     std::lock_guard<std::mutex> lock(mutex_);
-    RCLCPP_INFO(this->get_logger(),
+    RCLCPP_DEBUG(this->get_logger(),
         "[mapper_node_v5:heartbeat] intrinsics=%s frames=%d seen=%d accepted=%d objects=%zu tentative=%zu map_pub=%s cloud_pub=%s",
         intrinsics_ready_ ? "ready" : "missing",
         frame_count_,
@@ -565,25 +649,69 @@ void PointCloudMapperNodeV5::export_callback() {
         semantic_map_ ? semantic_map_->tentative_tracks.size() : 0,
         map_pub_ ? "ready" : "missing",
         (viewer_enabled_ && stable_cloud_pub_) ? "ready" : "disabled");
+
+    const auto now = std::chrono::steady_clock::now();
+    const double ms_since_sync = std::chrono::duration<double, std::milli>(now - last_sync_callback_time_).count();
+    const int frames_since_last_heartbeat = frame_count_ - last_heartbeat_frame_count_;
+    const int syncs_since_last_heartbeat = sync_callback_count_ - last_heartbeat_sync_count_;
+
+    if (frame_count_ > 0 && ms_since_sync > 2000.0 && syncs_since_last_heartbeat == 0) {
+        RCLCPP_ERROR(this->get_logger(),
+            "[mapper_node_v5:stuck] no synced callbacks for %.0f ms frames=%d(+%d) sync_cbs=%d(+%d) seen=%d accepted=%d objects=%zu tentative=%zu avg_total_ms=%.3f depth_ms=%.3f filter_ms=%.3f batch_ms=%.3f publish_ms=%.3f",
+            ms_since_sync,
+            frame_count_,
+            frames_since_last_heartbeat,
+            sync_callback_count_,
+            syncs_since_last_heartbeat,
+            detections_seen_total_,
+            detections_accepted_total_,
+            semantic_map_ ? semantic_map_->objects.size() : 0,
+            semantic_map_ ? semantic_map_->tentative_tracks.size() : 0,
+            timing_total_.average(),
+            timing_depth_conversion_.average(),
+            timing_filtering_.average(),
+            timing_batch_addition_.average(),
+            timing_publishing_.average());
+    } else {
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 30000,
+            "[mapper_node_v5:heartbeat] sync_cbs=%d ms_since_sync=%.0f frames=%d objects=%zu tentative=%zu",
+            sync_callback_count_, ms_since_sync, frame_count_,
+            semantic_map_ ? semantic_map_->objects.size() : 0,
+            semantic_map_ ? semantic_map_->tentative_tracks.size() : 0);
+    }
+
+    last_heartbeat_frame_count_ = frame_count_; 
+    last_heartbeat_sync_count_ = sync_callback_count_;
     if (frame_count_ == 0) {
         RCLCPP_WARN(this->get_logger(),
             "[mapper_node_v5:heartbeat] no completed synced callbacks yet; check topic names, sync timing, depth/frame ids, and TF availability");
     }
 }
 
-void PointCloudMapperNodeV5::print_timing_stats() {
-    if (frame_count_ == 0) return;
+void PointCloudMapperNodeV5::print_timing_stats(bool do_reset) {
+    if (frame_count_ == 0) {
+        if (do_reset) {
+            // nothing to reset
+        }
+        return;
+    }
     struct StepRow {
         const char* name;
         const TimingStats& stats;
     };
-    const std::array<StepRow, 6> rows = {{
+    const std::array<StepRow, 12> rows = {{
+        {"Lock Wait (Mutex)", timing_lock_wait_},
         {"Depth Conversion", timing_depth_conversion_},
         {"Point Extraction", timing_point_extraction_},
         {"Filtering (Voxel+Cluster)", timing_filtering_},
         {"Transform to Map", timing_transformation_},
         {"Batch Addition (Matching)", timing_batch_addition_},
-        {"Publishing", timing_publishing_}
+        {"Refine Geometry", timing_refine_geometry_},
+        {"Resolve Duplicates", timing_duplicate_resolution_},
+        {"Cleanup Wrong Detections", timing_wrong_detection_cleanup_},
+        {"Publish Semantic Map Msg", timing_publish_map_msg_},
+        {"Publish Stable Pointcloud", timing_publish_stable_cloud_},
+        {"Post-Batch Other", timing_publishing_}
     }};
     const double total_window_ms = timing_total_.total_time_ms;
     const double avg_total_frame_ms = timing_total_.average();
@@ -654,17 +782,25 @@ void PointCloudMapperNodeV5::print_timing_stats() {
               << std::setw(11) << 100.0
               << "\n";
     std::cout << std::string(118, '=') << "\n\n";
-    // Reset counters for the next reporting window.
-    timing_depth_conversion_.reset();
-    timing_point_extraction_.reset();
-    timing_filtering_.reset();
-    timing_transformation_.reset();
-    timing_batch_addition_.reset();
-    timing_publishing_.reset();
-    timing_total_.reset();
-    frame_count_ = 0;
-    detections_seen_total_ = 0;
-    detections_accepted_total_ = 0;
+    if (do_reset) {
+        // Reset counters for the next reporting window.
+        timing_lock_wait_.reset();
+        timing_depth_conversion_.reset();
+        timing_point_extraction_.reset();
+        timing_filtering_.reset();
+        timing_transformation_.reset();
+        timing_batch_addition_.reset();
+        timing_refine_geometry_.reset();
+        timing_duplicate_resolution_.reset();
+        timing_wrong_detection_cleanup_.reset();
+        timing_publish_map_msg_.reset();
+        timing_publish_stable_cloud_.reset();
+        timing_publishing_.reset();
+        timing_total_.reset();
+        frame_count_ = 0;
+        detections_seen_total_ = 0;
+        detections_accepted_total_ = 0;
+    }
 }
 
 // Node entry point.

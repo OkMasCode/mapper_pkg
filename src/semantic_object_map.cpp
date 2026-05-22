@@ -20,8 +20,11 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/segmentation/extract_clusters.h>
 #include <pcl/kdtree/kdtree.h>
+#include <rclcpp/rclcpp.hpp>
 
 namespace {
+
+const rclcpp::Logger semantic_logger = rclcpp::get_logger("SemanticObjectMapV5");
 
 inline bool obb_has_valid_shape(const OrientedBoundingBox& obb) {
     return obb.center.size() >= 3 && obb.extents.size() >= 3 && obb.rotation.size() >= 9 &&
@@ -71,7 +74,7 @@ inline void log_detection_fate(
     if (!extra.empty()) {
         oss << ' ' << extra;
     }
-    std::cout << oss.str() << "\n";
+    RCLCPP_DEBUG_STREAM(semantic_logger, oss.str());
 }
 
 inline void log_map_fate(
@@ -87,13 +90,13 @@ inline void log_map_fate(
     if (!extra.empty()) {
         oss << ' ' << extra;
     }
-    std::cout << oss.str() << "\n";
+    RCLCPP_DEBUG_STREAM(semantic_logger, oss.str());
 }
 
 } // namespace
 
 SemanticObjectMapV5::SemanticObjectMapV5() {
-    std::cout << "[SemanticObjectMap] Initialized with SOTA C++ Geometry and Tracking.\n";
+    RCLCPP_INFO(semantic_logger, "[SemanticObjectMap] Initialized with C++ Geometry and Tracking");
 }
 
 // Geometry and embedding helpers.
@@ -524,8 +527,9 @@ void SemanticObjectMapV5::update_object(
             entry.pose_map = {0.0f, 0.0f, 0.0f};
         }
 
-        std::cout << "[SemanticObjectMap] warning: invalid OBB for map_id=" << map_id
-                  << " after geometry fusion, using centroid fallback pose\n";
+        RCLCPP_WARN(semantic_logger,
+            "[SemanticObjectMap] invalid OBB for map_id=%s after geometry fusion, using centroid fallback pose",
+            map_id.c_str());
     }
     // Update class votes and confidence sums for consensus.
     entry.class_votes[object_name] += std::max(confidence, 0.01f);
@@ -559,9 +563,10 @@ void SemanticObjectMapV5::update_object(
         entry.frame = "map";
     }
     
-    std::cout << "    [MAP UPDATE] map_id=" << map_id << " class='" << entry.current_name 
-              << "' occurrences=" << entry.occurrences << " conf=" << entry.confidence_ema 
-              << " geometry_points=" << entry.accumulated_points->size() << "\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] map update map_id=%s class='%s' occurrences=%d conf=%.3f geometry_points=%zu",
+        map_id.c_str(), entry.current_name.c_str(), entry.occurrences,
+        entry.confidence_ema, entry.accumulated_points ? entry.accumulated_points->size() : 0);
 }
 
 bool SemanticObjectMapV5::update_tentative(
@@ -612,8 +617,9 @@ bool SemanticObjectMapV5::update_tentative(
         tentative_tracks[tracker_id] = t;
 
         log_detection_fate("tentative_create", tracker_id, object_name, confidence, "hits=1");
-        std::cout << "    [NEW TENTATIVE] track=" << tracker_id << " class='" << object_name 
-                  << "' conf=" << confidence << " points=" << points_map->size() << "\n";
+        RCLCPP_DEBUG(semantic_logger,
+            "[SemanticObjectMap] new tentative track=%s class='%s' conf=%.3f points=%zu",
+            tracker_id.c_str(), object_name.c_str(), confidence, points_map->size());
         return false;
     }
 
@@ -652,8 +658,9 @@ bool SemanticObjectMapV5::update_tentative(
             " age_sec=" + std::to_string(age_sec) +
             " avg_conf=" + std::to_string(avg_conf) +
             " max_conf=" + std::to_string(t.confidence_max));
-        std::cout << "    [UPDATE TENTATIVE] track=" << tracker_id << " hits=" << t.hits 
-                  << " age=" << age_sec << "s avg_conf=" << avg_conf << " (not ready for promotion)\n";
+        RCLCPP_DEBUG(semantic_logger,
+            "[SemanticObjectMap] update tentative track=%s hits=%d age=%.2fs avg_conf=%.3f (not ready for promotion)",
+            tracker_id.c_str(), t.hits, age_sec, avg_conf);
         return false;
     }
 
@@ -691,10 +698,9 @@ bool SemanticObjectMapV5::update_tentative(
 
     log_map_fate("promote_tentative", map_id, obj.current_name,
         std::string("track=") + tracker_id + " hits=" + std::to_string(obj.occurrences));
-    std::cout << "    >>> PROMOTED TO MAP <<<\n"
-              << "        new_map_id=" << map_id << " class='" << obj.current_name 
-              << "' from_track=" << tracker_id << " hits=" << t.hits 
-              << " age=" << age_sec << "s avg_conf=" << avg_conf << "\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] promoted to map new_map_id=%s class='%s' from_track=%s hits=%d age=%.2fs avg_conf=%.3f",
+        map_id.c_str(), obj.current_name.c_str(), tracker_id.c_str(), t.hits, age_sec, avg_conf);
     return true;
 }
 
@@ -711,12 +717,12 @@ void SemanticObjectMapV5::add_detections_batch(
     const std::string& camera_frame,
     const std::string& map_frame)
 {
-    std::cout << "\n[BATCH] >>> Starting batch association: " << points_cam_list.size() 
-              << " detections, current_map_objects=" << objects.size() 
-              << ", tentative_tracks=" << tentative_tracks.size() << "\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] batch start detections=%zu current_map_objects=%zu tentative_tracks=%zu",
+        points_cam_list.size(), objects.size(), tentative_tracks.size());
 
     if (points_cam_list.empty()) {
-        std::cout << "[BATCH] Empty input list, skipping\n";
+        RCLCPP_WARN(semantic_logger, "[SemanticObjectMap] batch skipped: empty input list");
         return;
     }
 
@@ -725,16 +731,16 @@ void SemanticObjectMapV5::add_detections_batch(
         confidences.size() != points_cam_list.size() ||
         embeddings_list_masked.size() != points_cam_list.size() ||
         embeddings_list_unmasked.size() != points_cam_list.size()) {
-        std::cout << "[BATCH] Size mismatch error!\n";
+        RCLCPP_ERROR(semantic_logger, "[SemanticObjectMap] batch size mismatch error");
         return;
     }
 
     long long current_ns = stamp_to_ns(stamp);
     prune_stale_state(current_ns);
 
-    std::cout << "[BATCH] state: objects=" << objects.size()
-              << " tentative=" << tentative_tracks.size()
-              << " bindings=" << track_to_map.size() << "\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] batch state objects=%zu tentative=%zu bindings=%zu",
+        objects.size(), tentative_tracks.size(), track_to_map.size());
 
     std::vector<int> unmatched_indices;
 
@@ -765,8 +771,9 @@ void SemanticObjectMapV5::add_detections_batch(
                     "' conf=" + std::to_string(confidences[i]) +
                     " emb_similarity=" + std::to_string(similarity) +
                     " reason=existing_track_binding_and_class_match");
-                std::cout << "  [ADDED TO MAP] track=" << t_id << " -> map_id=" << map_id 
-                          << " class='" << object_names[i] << "' conf=" << confidences[i] << "\n";
+                RCLCPP_DEBUG(semantic_logger,
+                    "[SemanticObjectMap] added to map track=%s -> map_id=%s class='%s' conf=%.3f",
+                    t_id.c_str(), map_id.c_str(), object_names[i].c_str(), confidences[i]);
                 update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding_masked, image_embedding_unmasked, current_ns, t_id);
                 track_last_seen_ns[t_id] = current_ns;
                 matched = true;
@@ -784,8 +791,9 @@ void SemanticObjectMapV5::add_detections_batch(
 
     if (unmatched_indices.empty()) return;
 
-    std::cout << "[SemanticObjectMap] batch unmatched after direct routing: "
-              << unmatched_indices.size() << "\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] batch unmatched after direct routing=%zu",
+        unmatched_indices.size());
 
     // Associate remaining detections with map objects using Hungarian matching.
     std::vector<std::string> map_ids;
@@ -793,13 +801,17 @@ void SemanticObjectMapV5::add_detections_batch(
 
     if (map_ids.empty()) {
     // No existing map objects to associate with, so route all unmatched detections to tentative tracks.
-        std::cout << "[BATCH] no map objects exist; routing " << unmatched_indices.size() << " unmatched detections to tentative\n";
+        RCLCPP_DEBUG(semantic_logger,
+            "[SemanticObjectMap] no map objects exist; routing %zu unmatched detections to tentative",
+            unmatched_indices.size());
         for (int det_idx : unmatched_indices) {
             const std::vector<float> image_embedding_masked = embeddings_list_masked[det_idx].has_value() ? embeddings_list_masked[det_idx].value() : std::vector<float>{};
             const std::vector<float> image_embedding_unmasked = embeddings_list_unmasked[det_idx].has_value() ? embeddings_list_unmasked[det_idx].value() : std::vector<float>{};
             log_detection_fate("route_tentative", tracker_ids[det_idx], object_names[det_idx], confidences[det_idx], "reason=map_empty");
-            std::cout << "  [TENTATIVE] track=" << tracker_ids[det_idx] << " class='" << object_names[det_idx] 
-                      << "' conf=" << confidences[det_idx] << "\n";
+            RCLCPP_DEBUG(semantic_logger,
+                "[SemanticObjectMap] tentative route track=%s class='%s' conf=%.3f points=%zu",
+                tracker_ids[det_idx].c_str(), object_names[det_idx].c_str(), confidences[det_idx],
+                points_cam_list[det_idx] ? points_cam_list[det_idx]->size() : 0);
             update_tentative(
                 object_names[det_idx],
                 tracker_ids[det_idx],
@@ -811,16 +823,17 @@ void SemanticObjectMapV5::add_detections_batch(
                 current_ns,
                 map_frame.empty() ? camera_frame : map_frame);
         }
-        std::cout << "[BATCH] complete via tentative routing: objects=" << objects.size()
-              << " tentative=" << tentative_tracks.size()
-              << " bindings=" << track_to_map.size() << "\n";
+        RCLCPP_DEBUG(semantic_logger,
+            "[SemanticObjectMap] batch complete via tentative routing objects=%zu tentative=%zu bindings=%zu",
+            objects.size(), tentative_tracks.size(), track_to_map.size());
         return; 
     }
 
     // N: unmatched detections, M: currently tracked map objects.
     int N = unmatched_indices.size();
     int M = map_ids.size();
-    std::cout << "[BATCH] Hungarian matching: " << N << " unmatched detections vs " << M << " map objects\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] Hungarian matching N=%d unmatched detections vs M=%d map objects", N, M);
     std::vector<std::vector<double>> costMatrix(N, std::vector<double>(M, kBlockedCost));
     const double nan_value = std::numeric_limits<double>::quiet_NaN();
     std::vector<std::vector<double>> distMatrix(N, std::vector<double>(M, nan_value));
@@ -850,10 +863,9 @@ void SemanticObjectMapV5::add_detections_batch(
             const bool has_pose = map_obj.pose_map.size() >= 3;
             const bool has_obb = obb_has_valid_shape(map_obj.obb);
             if (!has_pose || !has_obb) {
-                std::cout << "[SemanticObjectMap] batch skip geom: invalid map geometry map_id=" << map_ids[j]
-                          << " has_pose=" << (has_pose ? "1" : "0")
-                          << " has_obb=" << (has_obb ? "1" : "0")
-                          << "\n";
+                RCLCPP_WARN(semantic_logger,
+                    "[SemanticObjectMap] batch skip geom: invalid map geometry map_id=%s has_pose=%s has_obb=%s",
+                    map_ids[j].c_str(), has_pose ? "1" : "0", has_obb ? "1" : "0");
                 costMatrix[i][j] = kBlockedCost;
                 continue;
             }
@@ -997,7 +1009,8 @@ void SemanticObjectMapV5::add_detections_batch(
     std::vector<int> assignment;
     HungAlgo.Solve(costMatrix, assignment);
 
-    std::cout << "[SemanticObjectMap] hungarian solved for N=" << N << " M=" << M << "\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] hungarian solved N=%d M=%d", N, M);
 
     for (int i = 0; i < N; ++i) {
         int map_idx = assignment[i];
@@ -1047,9 +1060,9 @@ void SemanticObjectMapV5::add_detections_batch(
         }
     }
 
-    std::cout << "[BATCH] complete: map_objects=" << objects.size()
-              << " tentative=" << tentative_tracks.size()
-              << " bindings=" << track_to_map.size() << "\n\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] batch complete map_objects=%zu tentative=%zu bindings=%zu",
+        objects.size(), tentative_tracks.size(), track_to_map.size());
 }
 
 void SemanticObjectMapV5::fuse_objects(const std::string& keep_id, const std::string& drop_id) {
@@ -1126,8 +1139,9 @@ void SemanticObjectMapV5::resolve_overlapping_duplicates() {
         }
     }
     
-    std::cout << "[SemanticObjectMap][cleanup] removed_strict_duplicates=" 
-              << to_remove.size() << "\n";
+    RCLCPP_DEBUG(semantic_logger,
+        "[SemanticObjectMap] cleanup removed_strict_duplicates=%zu",
+        to_remove.size());
 }
 
 void SemanticObjectMapV5::remove_wrong_detections() {
@@ -1159,7 +1173,8 @@ void SemanticObjectMapV5::remove_wrong_detections() {
     }
 
     if (removed_count > 0) {
-        std::cout << "[SemanticObjectMap][cleanup] removed_wrong_detections=" << removed_count << "\n";
+        RCLCPP_DEBUG(semantic_logger,
+            "[SemanticObjectMap] cleanup removed_wrong_detections=%d", removed_count);
     }
 }
 

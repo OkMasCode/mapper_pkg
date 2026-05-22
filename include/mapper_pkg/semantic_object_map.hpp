@@ -104,12 +104,12 @@ class SemanticObjectMapV5 {
     float min_point_count = 800.0f;
     float max_point_count = 9000.0f;
     float min_voxel_size = 0.02f;
-    float max_voxel_size = 0.2f;
+    float max_voxel_size = 0.08f;
     int sor_mean_k = 50;
     int min_sor_k = 20;
     int max_sor_k = 120;
     float sor_stddev_mul_thresh = 1.0f;
-    float min_sor_stddev_mul_thresh = 1.5f;
+    float min_sor_stddev_mul_thresh = 1.0f;
     float max_sor_stddev_mul_thresh = 1.0f;
     bool enable_voxel_filtering = true;
     bool enable_icp_fusion_ = false;
