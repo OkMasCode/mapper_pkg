@@ -69,8 +69,9 @@ private:
     bool map_initialized_;
     
     double fov_rad_;
-    double max_depth_ = 2.5; // Stop projecting scores after 5 meters
+    double max_depth_ = 3.5; // Stop projecting scores after 5 meters
     double alpha_ = 0.6;     // Exponential Moving Average weight
+    double robot_exclusion_radius_ = 0.3; // Exclude frontiers within this radius of robot
 
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -83,6 +84,25 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_frontiers_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr pub_clusters_;
     rclcpp::Publisher<yolo11_seg_interfaces::msg::SimilarityCentroidArray>::SharedPtr pub_cluster_data_;
+    // --- HELPER FUNCTIONS ---
+
+    grid_map::Position getRobotPosition() {
+        // Get the robot's current position in the map frame
+        grid_map::Position robot_pos(0.0, 0.0);
+        try {
+            geometry_msgs::msg::TransformStamped transform = tf_buffer_->lookupTransform(
+                "map", "base_link", rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1)
+            );
+            robot_pos.x() = transform.transform.translation.x;
+            robot_pos.y() = transform.transform.translation.y;
+            RCLCPP_DEBUG(this->get_logger(), "Robot position: (%.2f, %.2f)", robot_pos.x(), robot_pos.y());
+        } catch (const tf2::TransformException & ex) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                "Could not get robot position from TF: %s", ex.what());
+        }
+        return robot_pos;
+    }
+
     // --- CALLBACKS ---
 
     void infoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
@@ -280,7 +300,31 @@ private:
             }
         }
 
-        return safe_frontiers;
+        // ==========================================
+        // STEP 3: Filter Frontiers Near Robot
+        // ==========================================
+        grid_map::Position robot_pos = getRobotPosition();
+        std::vector<grid_map::Position> robot_excluded_frontiers;
+        int excluded_count = 0;
+
+        for (const auto& pos : safe_frontiers) {
+            double distance_to_robot = (pos - robot_pos).norm();
+            
+            if (distance_to_robot > robot_exclusion_radius_) {
+                robot_excluded_frontiers.push_back(pos);
+            } else {
+                excluded_count++;
+                RCLCPP_DEBUG(this->get_logger(), 
+                    "Excluded frontier at (%.2f, %.2f): distance to robot = %.2f m (threshold = %.2f m)",
+                    pos.x(), pos.y(), distance_to_robot, robot_exclusion_radius_);
+            }
+        }
+
+        if (excluded_count > 0) {
+            RCLCPP_INFO(this->get_logger(), "Excluded %d frontier(s) near robot", excluded_count);
+        }
+
+        return robot_excluded_frontiers;
     }
 
     std::vector<FrontierCluster> clusterFrontiers(
