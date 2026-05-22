@@ -62,9 +62,9 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", true);
     voxel_size_ = this->declare_parameter("voxel_size", 0.04f);
     min_point_count_ = this->declare_parameter("min_point_count", 800.0f);
-    max_point_count_ = this->declare_parameter("max_point_count", 9000.0f);
+    max_point_count_ = this->declare_parameter("max_point_count", 7000.0f);
     min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.02f);
-    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.08f);
+    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.1f);
     // Statistical outlier removal
     do_sor_ = this->declare_parameter("do_sor_", true);
     sor_mean_k_ = this->declare_parameter("sor_mean_k", 50);
@@ -81,6 +81,10 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     // Initialize timing window state.
     last_timing_print_ = std::chrono::steady_clock::now();
     last_sync_callback_time_ = last_timing_print_;
+    last_mask_msg_time_ = last_timing_print_;
+    last_depth_msg_time_ = last_timing_print_;
+    last_mask_stamp_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
+    last_depth_stamp_ = rclcpp::Time(0, 0, this->get_clock()->get_clock_type());
     // Initialize TF interfaces.
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -98,8 +102,10 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     );
     mask_sub_.subscribe(this, dm_topic_, qos.get_rmw_qos_profile());
     depth_sub_.subscribe(this, depth_topic, qos.get_rmw_qos_profile());
+    mask_sub_.registerCallback(std::bind(&PointCloudMapperNodeV5::raw_detection_cb, this, _1));
+    depth_sub_.registerCallback(std::bind(&PointCloudMapperNodeV5::raw_depth_cb, this, _1));
     // Setup approximate-time synchronizer.
-    sync_ = std::make_shared<Sync>(SyncPolicy(10), mask_sub_, depth_sub_);
+    sync_ = std::make_shared<Sync>(SyncPolicy(100), mask_sub_, depth_sub_);
     sync_->registerCallback(std::bind(&PointCloudMapperNodeV5::synced_detection_callback, this, _1, _2));
 
     // Setup publishers and periodic maintenance timer.
@@ -142,6 +148,20 @@ void PointCloudMapperNodeV5::text_embedding_cb(const std_msgs::msg::Float32Multi
         RCLCPP_WARN(this->get_logger(),
             "[mapper_node_v5:text_embedding] ignored short message size=%zu", msg->data.size());
     }
+}
+
+void PointCloudMapperNodeV5::raw_detection_cb(
+    const yolo11_seg_interfaces::msg::DetectedObjectV3Array::ConstSharedPtr msg)
+{
+    last_mask_msg_time_ = std::chrono::steady_clock::now();
+    last_mask_stamp_ = rclcpp::Time(msg->header.stamp, this->get_clock()->get_clock_type());
+    mask_msg_count_++;
+}
+
+void PointCloudMapperNodeV5::raw_depth_cb(const sensor_msgs::msg::Image::ConstSharedPtr msg) {
+    last_depth_msg_time_ = std::chrono::steady_clock::now();
+    last_depth_stamp_ = rclcpp::Time(msg->header.stamp, this->get_clock()->get_clock_type());
+    depth_msg_count_++;
 }
 
 void PointCloudMapperNodeV5::synced_detection_callback(
@@ -652,17 +672,29 @@ void PointCloudMapperNodeV5::export_callback() {
 
     const auto now = std::chrono::steady_clock::now();
     const double ms_since_sync = std::chrono::duration<double, std::milli>(now - last_sync_callback_time_).count();
+    const double ms_since_mask = std::chrono::duration<double, std::milli>(now - last_mask_msg_time_).count();
+    const double ms_since_depth = std::chrono::duration<double, std::milli>(now - last_depth_msg_time_).count();
     const int frames_since_last_heartbeat = frame_count_ - last_heartbeat_frame_count_;
     const int syncs_since_last_heartbeat = sync_callback_count_ - last_heartbeat_sync_count_;
+    const int masks_since_last_heartbeat = mask_msg_count_ - last_heartbeat_mask_count_;
+    const int depths_since_last_heartbeat = depth_msg_count_ - last_heartbeat_depth_count_;
 
     if (frame_count_ > 0 && ms_since_sync > 2000.0 && syncs_since_last_heartbeat == 0) {
         RCLCPP_ERROR(this->get_logger(),
-            "[mapper_node_v5:stuck] no synced callbacks for %.0f ms frames=%d(+%d) sync_cbs=%d(+%d) seen=%d accepted=%d objects=%zu tentative=%zu avg_total_ms=%.3f depth_ms=%.3f filter_ms=%.3f batch_ms=%.3f publish_ms=%.3f",
+            "[mapper_node_v5:stuck] no synced callbacks for %.0f ms frames=%d(+%d) sync_cbs=%d(+%d) mask_msgs=%d(+%d) depth_msgs=%d(+%d) ms_since_mask=%.0f ms_since_depth=%.0f last_mask_stamp=%.3f last_depth_stamp=%.3f seen=%d accepted=%d objects=%zu tentative=%zu avg_total_ms=%.3f depth_ms=%.3f filter_ms=%.3f batch_ms=%.3f publish_ms=%.3f",
             ms_since_sync,
             frame_count_,
             frames_since_last_heartbeat,
             sync_callback_count_,
             syncs_since_last_heartbeat,
+            mask_msg_count_,
+            masks_since_last_heartbeat,
+            depth_msg_count_,
+            depths_since_last_heartbeat,
+            ms_since_mask,
+            ms_since_depth,
+            last_mask_stamp_.seconds(),
+            last_depth_stamp_.seconds(),
             detections_seen_total_,
             detections_accepted_total_,
             semantic_map_ ? semantic_map_->objects.size() : 0,
@@ -682,6 +714,8 @@ void PointCloudMapperNodeV5::export_callback() {
 
     last_heartbeat_frame_count_ = frame_count_; 
     last_heartbeat_sync_count_ = sync_callback_count_;
+    last_heartbeat_mask_count_ = mask_msg_count_;
+    last_heartbeat_depth_count_ = depth_msg_count_;
     if (frame_count_ == 0) {
         RCLCPP_WARN(this->get_logger(),
             "[mapper_node_v5:heartbeat] no completed synced callbacks yet; check topic names, sync timing, depth/frame ids, and TF availability");
