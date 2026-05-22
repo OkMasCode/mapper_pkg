@@ -59,6 +59,9 @@ private:
     void camera_info_cb(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
     // Receives global text embedding used for similarity scoring.
     void text_embedding_cb(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
+    // Raw callbacks for synchronization diagnostics.
+    void raw_detection_cb(const yolo11_seg_interfaces::msg::DetectedObjectV3Array::ConstSharedPtr msg);
+    void raw_depth_cb(const sensor_msgs::msg::Image::ConstSharedPtr msg);
     // Main synchronized callback for detections and depth.
     void synced_detection_callback(
         const yolo11_seg_interfaces::msg::DetectedObjectV3Array::ConstSharedPtr mask_msg,
@@ -133,18 +136,36 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr stable_cloud_pub_;
     rclcpp::TimerBase::SharedPtr export_timer_;
     // Per-stage timing accumulators.
+    TimingStats timing_lock_wait_;
     TimingStats timing_depth_conversion_;
     TimingStats timing_point_extraction_;
     TimingStats timing_filtering_;
     TimingStats timing_transformation_;
     TimingStats timing_batch_addition_;
+    TimingStats timing_refine_geometry_;
+    TimingStats timing_duplicate_resolution_;
+    TimingStats timing_wrong_detection_cleanup_;
+    TimingStats timing_publish_map_msg_;
+    TimingStats timing_publish_stable_cloud_;
     TimingStats timing_publishing_;
     TimingStats timing_total_;
     int frame_count_ = 0;
     int detections_seen_total_ = 0;
     int detections_accepted_total_ = 0;
     std::chrono::steady_clock::time_point last_timing_print_;
-    void print_timing_stats();
+    std::chrono::steady_clock::time_point last_sync_callback_time_;
+    std::chrono::steady_clock::time_point last_mask_msg_time_;
+    std::chrono::steady_clock::time_point last_depth_msg_time_;
+    int sync_callback_count_ = 0;
+    int mask_msg_count_ = 0;
+    int depth_msg_count_ = 0;
+    rclcpp::Time last_mask_stamp_;
+    rclcpp::Time last_depth_stamp_;
+    int last_heartbeat_frame_count_ = 0;
+    int last_heartbeat_sync_count_ = 0;
+    int last_heartbeat_mask_count_ = 0;
+    int last_heartbeat_depth_count_ = 0;
+    void print_timing_stats(bool do_reset = true);
 };
 
 #endif // POINTCLOUD_MAPPER_NODE_V5_HPP_
