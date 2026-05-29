@@ -90,7 +90,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     // Use sensor-data QoS profile.
     rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
-    auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 1), qos_profile);
+    auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 10), qos_profile);
     // Setup subscriptions.
     cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
         cm_info_topic, qos, // /camera/camera/aligned_depth_to_color/camera_info
@@ -105,7 +105,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     mask_sub_.registerCallback(std::bind(&PointCloudMapperNodeV5::raw_detection_cb, this, _1));
     depth_sub_.registerCallback(std::bind(&PointCloudMapperNodeV5::raw_depth_cb, this, _1));
     // Setup approximate-time synchronizer.
-    sync_ = std::make_shared<Sync>(SyncPolicy(100), mask_sub_, depth_sub_);
+    sync_ = std::make_shared<Sync>(SyncPolicy(10), mask_sub_, depth_sub_);
     sync_->registerCallback(std::bind(&PointCloudMapperNodeV5::synced_detection_callback, this, _1, _2));
 
     // Setup publishers and periodic maintenance timer.
