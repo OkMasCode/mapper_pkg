@@ -86,8 +86,8 @@ class SemanticObjectMapV5 {
     std::unordered_map<std::string, long long> track_last_seen_ns;
     // Update tentative parameters
     float min_input_confidence = 0.55f;
-    int confirmation_min_hits = 4;
-    float confirmation_min_age_sec = 0.8f;
+    int confirmation_min_hits = 5;
+    float confirmation_min_age_sec = 1.0f;
     float min_confidence_for_promotion = 0.6f;
     float min_avg_confidence_for_promotion = 0.55f;
     // stale pruning parameters
@@ -120,7 +120,7 @@ class SemanticObjectMapV5 {
     double refine_cluster_tolerance = 0.06;
     int refine_min_cluster_size = 70;
     int refine_max_cluster_size = 25000;
-    bool enable_clustering_refinement = false;
+    bool enable_clustering_refinement = true;
     bool enable_sor_refinement = false;
     // scoring parameters
     double w_sem = 2.5;
@@ -133,11 +133,11 @@ class SemanticObjectMapV5 {
     float association_large_object_min_size = 2.0f;
     double association_small_object_dist_weight = 5.0;
     double association_small_object_iou_weight = 4.0;
-    double association_large_object_dist_weight = 0.6;
-    double association_large_object_iou_weight = 1.0;
+    double association_large_object_dist_weight = 0.2;
+    double association_large_object_iou_weight = 0.3;
     // Remove wrong detections parameters
     double kMaxAgeSec = 20.0;
-    int kMinOccurrences = 20;
+    int kMinOccurrences = 50;
 
 
     // Adds a synchronized batch of detections and updates object memory.
