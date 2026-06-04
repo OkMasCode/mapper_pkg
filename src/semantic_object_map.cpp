@@ -736,7 +736,11 @@ void SemanticObjectMapV5::add_detections_batch(
     }
 
     long long current_ns = stamp_to_ns(stamp);
-    prune_stale_state(current_ns);
+    if (do_prune) {
+        prune_stale_state(current_ns);
+    } else {
+        RCLCPP_DEBUG(semantic_logger, "[SemanticObjectMap] batch skipping pruning (do_prune=false)");
+    }
 
     RCLCPP_DEBUG(semantic_logger,
         "[SemanticObjectMap] batch state objects=%zu tentative=%zu bindings=%zu",

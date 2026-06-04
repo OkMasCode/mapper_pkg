@@ -86,31 +86,32 @@ class SemanticObjectMapV5 {
     std::unordered_map<std::string, long long> track_last_seen_ns;
     // Update tentative parameters
     float min_input_confidence = 0.55f;
-    int confirmation_min_hits = 5;
-    float confirmation_min_age_sec = 1.0f;
+    int confirmation_min_hits = 4;
+    float confirmation_min_age_sec = 0.8f;
     float min_confidence_for_promotion = 0.6f;
     float min_avg_confidence_for_promotion = 0.55f;
     // stale pruning parameters
-    float tentative_max_stale_sec = 5.0f;
-    float binding_ttl_sec = 10.0f;
+    float tentative_max_stale_sec = 2.0f;
+    float binding_ttl_sec = 4.0f;
     float confidence_ema_alpha = 0.20f;
+    bool do_prune = false;
     // class consensus parameters
     float class_count_weight = 1.0f;
     float class_confidence_weight = 2.0f;
     float class_switch_margin = 0.75f;
     int min_class_votes_to_lock = 4;
     // voxel filtering
-    float voxel_size = 0.04f;
+    float voxel_size = 0.01f;
     float min_point_count = 800.0f;
-    float max_point_count = 6000.0f;
-    float min_voxel_size = 0.05f;
-    float max_voxel_size = 0.2f;
-    int sor_mean_k = 50;
-    int min_sor_k = 20;
-    int max_sor_k = 120;
-    float sor_stddev_mul_thresh = 1.0f;
-    float min_sor_stddev_mul_thresh = 1.0f;
-    float max_sor_stddev_mul_thresh = 1.0f;
+    float max_point_count = 5000.0f;
+    float min_voxel_size = 0.01f;
+    float max_voxel_size = 0.08f;
+    int sor_mean_k = 500;
+    int min_sor_k = 200;
+    int max_sor_k = 1000;
+    float sor_stddev_mul_thresh = 2.0f;
+    float min_sor_stddev_mul_thresh = 1.5f;
+    float max_sor_stddev_mul_thresh = 1.5f;
     bool enable_voxel_filtering = true;
     bool enable_icp_fusion_ = false;
     bool enable_statistical_outlier_removal = true;
@@ -122,21 +123,21 @@ class SemanticObjectMapV5 {
     bool enable_clustering_refinement = false;
     bool enable_sor_refinement = false;
     // scoring parameters
-    double w_sem = 3.5;
-    double MAX_COST = 4.5;
+    double w_sem = 2.5;
+    double MAX_COST = 4.0;
     double kBlockedCost = 999.0;
     int kTopKPerDetection = 3;
     double max_class_penalty = 3.0;
     // Dynamic association weights based on object size.
-    float association_small_object_max_size = 0.05f;
+    float association_small_object_max_size = 0.2f;
     float association_large_object_min_size = 2.0f;
     double association_small_object_dist_weight = 5.0;
     double association_small_object_iou_weight = 4.0;
-    double association_large_object_dist_weight = 0.2;
-    double association_large_object_iou_weight = 0.3;
+    double association_large_object_dist_weight = 0.6;
+    double association_large_object_iou_weight = 1.0;
     // Remove wrong detections parameters
     double kMaxAgeSec = 20.0;
-    int kMinOccurrences = 50;
+    int kMinOccurrences = 20;
 
 
     // Adds a synchronized batch of detections and updates object memory.

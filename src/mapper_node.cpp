@@ -49,7 +49,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     std::string depth_topic = this->declare_parameter("depth_topic", "/jackal/sensors/camera_0/aligned_depth_to_color/image");
     std::string cm_info_topic = this->declare_parameter("camera_info_topic", "/jackal/sensors/camera_0/aligned_depth_to_color/camera_info");
     std::string text_emb_topic = this->declare_parameter("vision_topic", "/vision/text_embedding");
-    output_dir_ = this->declare_parameter("output_dir", "/home/workspace/ros2_ws/src/yolo11_seg_bringup/config/");
+    output_dir_ = this->declare_parameter("output_dir", "/workspaces/ros2_ws/src/yolo11_seg_bringup/config/");
     output_map_file_ = this->declare_parameter("output_map_file", "map_v6.json");
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
@@ -57,14 +57,14 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     export_interval_ = this->declare_parameter("export_interval", 5.0);
     // Distance filtering
     min_range_ = this->declare_parameter("min_range", 0.1f);
-    max_range_ = this->declare_parameter("max_range", 3.0f);
+    max_range_ = this->declare_parameter("max_range", 6.0f);
     // Voxel filtering
     do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", true);
-    voxel_size_ = this->declare_parameter("voxel_size", 0.04f);
+    voxel_size_ = this->declare_parameter("voxel_size", 0.05f);
     min_point_count_ = this->declare_parameter("min_point_count", 800.0f);
-    max_point_count_ = this->declare_parameter("max_point_count", 7000.0f);
-    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.02f);
-    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.1f);
+    max_point_count_ = this->declare_parameter("max_point_count", 5000.0f);
+    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.01f);
+    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.08f);
     // Statistical outlier removal
     do_sor_ = this->declare_parameter("do_sor_", true);
     sor_mean_k_ = this->declare_parameter("sor_mean_k", 50);
