@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <memory>
 #include <tuple>
+#include <utility>
 #include <optional>
 #include <array>
 #include <builtin_interfaces/msg/time.hpp>
@@ -43,7 +44,7 @@ struct MapObject {
     std::unordered_map<std::string, float> class_conf_sums;
     // Similarity and embedding history used for association and goal scoring.
     float similarity = 0.0f;
-    float confidence_ema = 0.0f;
+    float confidence_ema = 0.0f; // Moving average of the confidence
     std::vector<float> image_embedding_masked;
     std::vector<float> image_embedding_unmasked;
     float embedding_confidence_max = -1.0f;
@@ -94,7 +95,7 @@ class SemanticObjectMapV5 {
     float tentative_max_stale_sec = 2.0f;
     float binding_ttl_sec = 4.0f;
     float confidence_ema_alpha = 0.20f;
-    bool do_prune = false;
+    bool do_prune = true;
     // class consensus parameters
     float class_count_weight = 1.0f;
     float class_confidence_weight = 2.0f;
@@ -113,7 +114,6 @@ class SemanticObjectMapV5 {
     float min_sor_stddev_mul_thresh = 1.5f;
     float max_sor_stddev_mul_thresh = 1.5f;
     bool enable_voxel_filtering = true;
-    bool enable_icp_fusion_ = false;
     bool enable_statistical_outlier_removal = true;
     // geometry refinement parameters
     int refine_min_point_count = 20;
@@ -138,7 +138,6 @@ class SemanticObjectMapV5 {
     // Remove wrong detections parameters
     double kMaxAgeSec = 20.0;
     int kMinOccurrences = 50;
-
 
     // Adds a synchronized batch of detections and updates object memory.
     void add_detections_batch(
@@ -208,6 +207,10 @@ class SemanticObjectMapV5 {
     float oriented_overlap_ratio(
         pcl::PointCloud<pcl::PointXYZ>::Ptr points1, const OrientedBoundingBox& obb1,
         pcl::PointCloud<pcl::PointXYZ>::Ptr points2, const OrientedBoundingBox& obb2);
+
+    // Returns the {distance, IoU} cost weights for the given object size,
+    // blending from the strict small-object regime to the permissive large one.
+    std::pair<double, double> association_weights(float max_size) const;
 
     // Internal update routines for tentative and confirmed objects.
     bool update_tentative(
