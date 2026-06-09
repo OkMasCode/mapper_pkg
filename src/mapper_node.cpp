@@ -254,6 +254,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     std::vector<std::string> object_names;
     std::vector<std::string> tracker_ids;
     std::vector<float> confidences;
+    std::vector<float> similarities;
     std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> points_cam_list;
     std::vector<std::optional<std::vector<float>>> embeddings_list_masked;
     std::vector<std::optional<std::vector<float>>> embeddings_list_unmasked;
@@ -375,6 +376,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         object_names.push_back(det.class_name);
         tracker_ids.push_back(std::to_string(det.instance_id));
         confidences.push_back(det.confidence);
+        similarities.push_back(det.similarity);
         points_cam_list.push_back(cloud_map);
         if (!det.image_embedding_masked.empty()) {
             embeddings_list_masked.emplace_back(det.image_embedding_masked);
@@ -404,7 +406,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             ">>> PROCESSING BATCH: %zu detections -> semantic map association (current objects: %zu, tentative: %zu)",
             points_cam_list.size(), semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
         semantic_map_->add_detections_batch(
-            object_names, tracker_ids, confidences, points_cam_list, embeddings_list_masked, embeddings_list_unmasked,
+            object_names, tracker_ids, confidences, similarities, points_cam_list, embeddings_list_masked, embeddings_list_unmasked,
             mask_msg->header.stamp, camera_frame_, map_frame_
         );
         auto t_batch_end = std::chrono::steady_clock::now();
@@ -600,7 +602,10 @@ void PointCloudMapperNodeV5::publish_semantic_map() {
         obj_msg.confidence = entry.confidence_ema;
         obj_msg.image_embedding_masked = entry.image_embedding_masked;
         obj_msg.image_embedding_unmasked = entry.image_embedding_unmasked;
-        obj_msg.similarity = semantic_map_->get_goal_similarity(map_id);
+        // Publish the highest goal similarity reported by the vision node, instead of
+        // recomputing it from the time-averaged map embedding (which collapses under SigLIP's
+        // steep logit scaling). entry.similarity holds the running max from the detections.
+        obj_msg.similarity = entry.similarity;
         msg.objects.push_back(obj_msg);
     }
     map_pub_->publish(msg);

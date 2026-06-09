@@ -548,7 +548,10 @@ void SemanticObjectMapV5::update_object(
         entry.image_embedding_unmasked = fuse_embeddings_running_avg(entry.image_embedding_unmasked, entry.occurrences, image_embedding_unmasked, 1);
     }
 
-    entry.similarity = std::isfinite(similarity) ? similarity : 0.0f;
+    // Keep the highest goal similarity reported by the vision node for this object.
+    if (std::isfinite(similarity)) {
+        entry.similarity = std::max(entry.similarity, similarity);
+    }
 
     entry.occurrences += 1;
     entry.last_seen_ns = current_ns;
@@ -575,6 +578,7 @@ bool SemanticObjectMapV5::update_tentative(
     pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
     const builtin_interfaces::msg::Time& detection_stamp,
     float confidence,
+    float similarity,
     const std::vector<float>& image_embedding_masked,
     const std::vector<float>& image_embedding_unmasked,
     long long current_ns,
@@ -607,6 +611,7 @@ bool SemanticObjectMapV5::update_tentative(
         t.class_name = object_name;
         t.confidence_max = confidence;
         t.confidence_sum = confidence;
+        t.similarity_max = std::isfinite(similarity) ? similarity : 0.0f;
         if (!image_embedding_masked.empty()) {
             t.image_embedding_masked = normalize_embedding(image_embedding_masked);
             t.embedding_confidence_max = confidence;
@@ -631,6 +636,9 @@ bool SemanticObjectMapV5::update_tentative(
     t.timestamp = detection_stamp;
     t.confidence_sum += confidence;
     t.confidence_max = std::max(t.confidence_max, confidence);
+    if (std::isfinite(similarity)) {
+        t.similarity_max = std::max(t.similarity_max, similarity);
+    }
     if (!image_embedding_masked.empty()) {
         t.embedding_confidence_max = std::max(t.embedding_confidence_max, confidence);
         t.image_embedding_masked = fuse_embeddings_running_avg(t.image_embedding_masked, t.hits - 1, image_embedding_masked, 1);
@@ -685,7 +693,7 @@ bool SemanticObjectMapV5::update_tentative(
         obj.current_name,
         detection_stamp,
         t.accumulated_points,
-        0.0f,
+        t.similarity_max,
         static_cast<float>(avg_conf),
         t.image_embedding_masked,
         t.image_embedding_unmasked,
@@ -710,6 +718,7 @@ void SemanticObjectMapV5::add_detections_batch(
     const std::vector<std::string>& object_names,
     const std::vector<std::string>& tracker_ids,
     const std::vector<float>& confidences,
+    const std::vector<float>& similarities,
     const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list,
     const std::vector<std::optional<std::vector<float>>>& embeddings_list_masked,
     const std::vector<std::optional<std::vector<float>>>& embeddings_list_unmasked,
@@ -774,7 +783,7 @@ void SemanticObjectMapV5::add_detections_batch(
                 RCLCPP_DEBUG(semantic_logger,
                     "[SemanticObjectMap] added to map track=%s -> map_id=%s class='%s' conf=%.3f",
                     t_id.c_str(), map_id.c_str(), object_names[i].c_str(), confidences[i]);
-                update_object(map_id, object_names[i], stamp, points_cam_list[i], similarity, confidences[i], image_embedding_masked, image_embedding_unmasked, current_ns, t_id);
+                update_object(map_id, object_names[i], stamp, points_cam_list[i], similarities[i], confidences[i], image_embedding_masked, image_embedding_unmasked, current_ns, t_id);
                 track_last_seen_ns[t_id] = current_ns;
                 matched = true;
             } else {
@@ -818,6 +827,7 @@ void SemanticObjectMapV5::add_detections_batch(
                 points_cam_list[det_idx],
                 stamp,
                 confidences[det_idx],
+                similarities[det_idx],
                 image_embedding_masked,
                 image_embedding_unmasked,
                 current_ns,
@@ -1039,7 +1049,7 @@ void SemanticObjectMapV5::add_detections_batch(
                 " w_sem=" + std::to_string(w_sem) +
                 " max_cost=" + std::to_string(MAX_COST));
             // Update matched stable object and refresh tracker binding.
-            update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarity, confidences[det_idx], image_embedding_masked, image_embedding_unmasked, current_ns, tracker_ids[det_idx]);
+            update_object(m_id, object_names[det_idx], stamp, points_cam_list[det_idx], similarities[det_idx], confidences[det_idx], image_embedding_masked, image_embedding_unmasked, current_ns, tracker_ids[det_idx]);
             track_to_map[tracker_ids[det_idx]] = m_id;
             track_last_seen_ns[tracker_ids[det_idx]] = current_ns;
         } else {
@@ -1053,6 +1063,7 @@ void SemanticObjectMapV5::add_detections_batch(
                 points_cam_list[det_idx],
                 stamp,
                 confidences[det_idx],
+                similarities[det_idx],
                 image_embedding_masked,
                 image_embedding_unmasked,
                 current_ns,

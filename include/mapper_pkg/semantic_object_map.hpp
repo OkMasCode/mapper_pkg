@@ -71,6 +71,8 @@ struct TentativeTrack {
     std::vector<float> image_embedding_masked;
     std::vector<float> image_embedding_unmasked;
     float embedding_confidence_max = -1.0f;
+    // Highest goal similarity reported by the vision node while tentative.
+    float similarity_max = 0.0f;
 };
 
 // Core mapper that associates detections, tracks object state, and maintains geometry.
@@ -144,6 +146,7 @@ class SemanticObjectMapV5 {
         const std::vector<std::string>& object_names,
         const std::vector<std::string>& tracker_ids,
         const std::vector<float>& confidences,
+        const std::vector<float>& similarities,
         const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& points_cam_list,
         const std::vector<std::optional<std::vector<float>>>& embeddings_list_masked,
         const std::vector<std::optional<std::vector<float>>>& embeddings_list_unmasked,
@@ -215,6 +218,7 @@ class SemanticObjectMapV5 {
         pcl::PointCloud<pcl::PointXYZ>::Ptr points_map,
         const builtin_interfaces::msg::Time& detection_stamp,
         float confidence,
+        float similarity,
         const std::vector<float>& image_embedding_masked,
         const std::vector<float>& image_embedding_unmasked,
         long long current_ns,
