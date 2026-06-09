@@ -22,24 +22,6 @@
 using std::placeholders::_1;
 using std::placeholders::_2;
 
-namespace {
-
-std::string format_detection_trace(
-    size_t index,
-    const yolo11_seg_interfaces::msg::DetectedObjectV3& det,
-    const char* stage)
-{
-    std::ostringstream oss;
-    oss << "[mapper_node_v5:det:" << stage << "]"
-        << " idx=" << index
-        << " id=" << det.instance_id
-        << " class='" << det.class_name << "'"
-        << " conf=" << std::fixed << std::setprecision(3) << det.confidence;
-    return oss.str();
-}
-
-} // namespace
-
 PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_v5") {
     RCLCPP_INFO(this->get_logger(), "[mapper_node_v5:init] starting initialization");
     // Declare node parameters.
@@ -49,7 +31,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     std::string depth_topic = this->declare_parameter("depth_topic", "/jackal/sensors/camera_0/aligned_depth_to_color/image");
     std::string cm_info_topic = this->declare_parameter("camera_info_topic", "/jackal/sensors/camera_0/aligned_depth_to_color/camera_info");
     std::string text_emb_topic = this->declare_parameter("vision_topic", "/vision/text_embedding");
-    output_dir_ = this->declare_parameter("output_dir", "/home/workspace/ros2_ws/src/yolo11_seg_bringup/config/");
+    output_dir_ = this->declare_parameter("output_dir", "/workspaces/ros2_ws/src/yolo11_seg_bringup/config/");
     output_map_file_ = this->declare_parameter("output_map_file", "map_v6.json");
     stable_pointcloud_topic_ = this->declare_parameter("stable_pointcloud_topic", "/vision/semantic_map_v5/points");
     publish_stable_pointcloud_enabled_ = this->declare_parameter("publish_stable_pointcloud", true);
@@ -57,14 +39,14 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     export_interval_ = this->declare_parameter("export_interval", 5.0);
     // Distance filtering
     min_range_ = this->declare_parameter("min_range", 0.1f);
-    max_range_ = this->declare_parameter("max_range", 3.0f);
+    max_range_ = this->declare_parameter("max_range", 6.0f);
     // Voxel filtering
     do_voxel_filtering_ = this->declare_parameter("do_voxel_filtering", true);
-    voxel_size_ = this->declare_parameter("voxel_size", 0.04f);
+    voxel_size_ = this->declare_parameter("voxel_size", 0.05f);
     min_point_count_ = this->declare_parameter("min_point_count", 800.0f);
-    max_point_count_ = this->declare_parameter("max_point_count", 7000.0f);
-    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.02f);
-    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.1f);
+    max_point_count_ = this->declare_parameter("max_point_count", 5000.0f);
+    min_voxel_size_ = this->declare_parameter("min_voxel_size", 0.01f);
+    max_voxel_size_ = this->declare_parameter("max_voxel_size", 0.08f);
     // Statistical outlier removal
     do_sor_ = this->declare_parameter("do_sor_", true);
     sor_mean_k_ = this->declare_parameter("sor_mean_k", 50);
@@ -93,7 +75,7 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 10), qos_profile);
     // Setup subscriptions.
     cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-        cm_info_topic, qos, // /camera/camera/aligned_depth_to_color/camera_info
+        cm_info_topic, qos,
         std::bind(&PointCloudMapperNodeV5::camera_info_cb, this, _1)
     ); 
     text_emb_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
@@ -107,7 +89,6 @@ PointCloudMapperNodeV5::PointCloudMapperNodeV5() : Node("pointcloud_mapper_node_
     // Setup approximate-time synchronizer.
     sync_ = std::make_shared<Sync>(SyncPolicy(10), mask_sub_, depth_sub_);
     sync_->registerCallback(std::bind(&PointCloudMapperNodeV5::synced_detection_callback, this, _1, _2));
-
     // Setup publishers and periodic maintenance timer.
     map_pub_ = this->create_publisher<yolo11_seg_interfaces::msg::SemanticObjectArray>("/vision/semantic_map_v5", 10);
     if (viewer_enabled_) {
@@ -133,17 +114,12 @@ void PointCloudMapperNodeV5::camera_info_cb(const sensor_msgs::msg::CameraInfo::
 
 void PointCloudMapperNodeV5::text_embedding_cb(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(mutex_);
-    RCLCPP_DEBUG(this->get_logger(),
-        "[mapper_node_v5:text_embedding] received vector size=%zu", msg->data.size());
     // Expect embedding values followed by scale and bias (last two elements of the vector).
     if (msg->data.size() > 2) {
         float bias = msg->data.back();
         float scale = msg->data[msg->data.size() - 2];
         std::vector<float> emb(msg->data.begin(), msg->data.end() - 2);
         semantic_map_->set_text_embedding(emb, scale, bias);
-        RCLCPP_DEBUG(this->get_logger(),
-            "[mapper_node_v5:text_embedding] applied embedding_len=%zu scale=%.3f bias=%.3f",
-            emb.size(), scale, bias);
     } else {
         RCLCPP_WARN(this->get_logger(),
             "[mapper_node_v5:text_embedding] ignored short message size=%zu", msg->data.size());
@@ -176,11 +152,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     auto t_lock_wait_end = std::chrono::steady_clock::now();
     timing_lock_wait_.total_time_ms += std::chrono::duration<double, std::milli>(t_lock_wait_end - t_lock_wait_start).count();
     timing_lock_wait_.count++;
-    RCLCPP_DEBUG(this->get_logger(),
-        "=== NEW DETECTION FRAME RECEIVED === frame_detections=%zu depth_frame=%s mask_frame=%s",
-        mask_msg->detections.size(),
-        depth_msg->header.frame_id.c_str(),
-        mask_msg->header.frame_id.c_str());
     detections_seen_total_ += static_cast<int>(mask_msg->detections.size());
     if (!intrinsics_ready_) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
@@ -231,14 +202,17 @@ void PointCloudMapperNodeV5::synced_detection_callback(
                 map_frame_, source_frame, source_stamp, rclcpp::Duration::from_seconds(0.10));
             // Populate the matrix
             tf_source_to_map.translation() <<
+                // Extract translation form the message
                 static_cast<float>(tf_msg.transform.translation.x),
                 static_cast<float>(tf_msg.transform.translation.y),
                 static_cast<float>(tf_msg.transform.translation.z);
             const Eigen::Quaternionf q(
+                // Extract quaternion from the message
                 static_cast<float>(tf_msg.transform.rotation.w),
                 static_cast<float>(tf_msg.transform.rotation.x),
                 static_cast<float>(tf_msg.transform.rotation.y),
                 static_cast<float>(tf_msg.transform.rotation.z));
+            // Convert quaternion to rotation matrix
             tf_source_to_map.linear() = q.normalized().toRotationMatrix(); // Update of the rotation compoment of the transform
         } catch (const tf2::TransformException& ex) {
             RCLCPP_WARN_THROTTLE(
@@ -264,13 +238,8 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     double frame_tf_total_ms = 0.0;
     // Process each detection and build a map-frame batch.
     for (size_t det_index = 0; det_index < mask_msg->detections.size(); ++det_index) {
+        // Isolate the single detection
         const auto& det = mask_msg->detections[det_index];
-        const std::string det_tag = format_detection_trace(det_index, det, "enter");
-        RCLCPP_DEBUG(this->get_logger(), 
-            "  [DET %zu/%zu] id=%s class='%s' conf=%.3f", 
-            det_index + 1, mask_msg->detections.size(),
-            det_tag.c_str(), det.class_name.c_str(), det.confidence);
-        
         if (det.mask.width == 0 || det.mask.height == 0) {
             RCLCPP_WARN(this->get_logger(), "    -> DROPPED: no mask image");
             continue;
@@ -282,13 +251,14 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         if (cv_mask.size() != depth_m.size()) {
             cv::resize(cv_mask, cv_mask, depth_m.size(), 0, 0, cv::INTER_NEAREST);
         }
+        // Extract the raw point cloud for this detection's mask
         auto raw_cloud = get_points_in_mask(depth_m, cv_mask);
         auto t_extract_end = std::chrono::steady_clock::now();
         const double frame_extract_ms = std::chrono::duration<double, std::milli>(t_extract_end - t_extract_start).count();
         timing_point_extraction_.total_time_ms += frame_extract_ms;
         timing_point_extraction_.count++;
         frame_extract_total_ms += frame_extract_ms;
-        if (raw_cloud->points.size() < 4) {
+        if (raw_cloud->points.size() < 1) {
             RCLCPP_WARN(this->get_logger(),
                 "    -> DROPPED: raw cloud too small (points=%zu)",
                 raw_cloud->points.size());
@@ -297,7 +267,8 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         auto t_filter_start = std::chrono::steady_clock::now();
 
         /*--------------FILTERING--------------*/
-
+        
+        // Initialize intermediate clouds for filtering stages.
         pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::PointCloud<pcl::PointXYZ>::Ptr sor_cloud(new pcl::PointCloud<pcl::PointXYZ>());
         pcl::PointCloud<pcl::PointXYZ>::Ptr clean_cloud(new pcl::PointCloud<pcl::PointXYZ>());
@@ -350,10 +321,7 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         timing_filtering_.total_time_ms += frame_filter_ms;
         timing_filtering_.count++;
         frame_filter_total_ms += frame_filter_ms;
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "[mapper_node_v5:filter] raw_points=%zu clean_points=%zu filter_ms=%.2f",
-            raw_cloud->points.size(), clean_cloud->points.size(), frame_filter_ms);
-        if (clean_cloud->points.size() < 4) {
+        if (clean_cloud->points.size() < 1) {
             RCLCPP_WARN(this->get_logger(),
                 "    -> DROPPED: clean cloud too small (points=%zu)",
                 clean_cloud->points.size());
@@ -389,22 +357,12 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             embeddings_list_unmasked.emplace_back(std::nullopt);
         }
         accepted_detections++;
-        RCLCPP_DEBUG(this->get_logger(),
-            "    -> ACCEPTED: geometry_points=%zu, queued for map association",
-            clean_cloud->points.size());
     }
     detections_accepted_total_ += accepted_detections;
-    RCLCPP_DEBUG(this->get_logger(),
-        "=== BATCH SUMMARY === frame_detections=%d accepted=%d total_seen=%d total_accepted=%d",
-        static_cast<int>(mask_msg->detections.size()), accepted_detections, 
-        detections_seen_total_, detections_accepted_total_);
     
     // Pass the prepared batch into semantic association logic.
     if (!points_cam_list.empty()) {
         auto t_batch_start = std::chrono::steady_clock::now();
-        RCLCPP_DEBUG(this->get_logger(),
-            ">>> PROCESSING BATCH: %zu detections -> semantic map association (current objects: %zu, tentative: %zu)",
-            points_cam_list.size(), semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
         semantic_map_->add_detections_batch(
             object_names, tracker_ids, confidences, similarities, points_cam_list, embeddings_list_masked, embeddings_list_unmasked,
             mask_msg->header.stamp, camera_frame_, map_frame_
@@ -413,9 +371,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         const double frame_batch_ms = std::chrono::duration<double, std::milli>(t_batch_end - t_batch_start).count();
         timing_batch_addition_.total_time_ms += frame_batch_ms;
         timing_batch_addition_.count++;
-        RCLCPP_DEBUG(this->get_logger(),
-            "<<< BATCH PROCESSING COMPLETE: map objects now = %zu, tentative = %zu",
-            semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
     } else {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
             "[mapper_node_v5:sync] no detections survived filtering in this frame");
@@ -429,9 +384,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     double post_batch_accounted_ms = 0.0;
     try {
         // Refine each object cloud before duplicate cleanup.
-        RCLCPP_DEBUG(this->get_logger(),
-            "[mapper_node_v5:publish] semantic_map objects=%zu tentative=%zu before refine",
-            semantic_map_->objects.size(), semantic_map_->tentative_tracks.size());
         auto t_refine_start = std::chrono::steady_clock::now();
         for (const auto& [map_id, entry] : semantic_map_->objects) {
             semantic_map_->refine_object_geometry(map_id);
@@ -441,7 +393,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         timing_refine_geometry_.total_time_ms += refine_ms;
         timing_refine_geometry_.count++;
         post_batch_accounted_ms += refine_ms;
-
         // Run duplicate and stale-object cleanup.
         auto t_resolve_start = std::chrono::steady_clock::now();
         semantic_map_->resolve_overlapping_duplicates();
@@ -450,7 +401,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         timing_duplicate_resolution_.total_time_ms += resolve_ms;
         timing_duplicate_resolution_.count++;
         post_batch_accounted_ms += resolve_ms;
-
         auto t_cleanup_start = std::chrono::steady_clock::now();
         semantic_map_->remove_wrong_detections();
         auto t_cleanup_end = std::chrono::steady_clock::now();
@@ -458,7 +408,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
         timing_wrong_detection_cleanup_.total_time_ms += cleanup_ms;
         timing_wrong_detection_cleanup_.count++;
         post_batch_accounted_ms += cleanup_ms;
-
         auto t_publish_map_start = std::chrono::steady_clock::now();
         publish_semantic_map();
         auto t_publish_map_end = std::chrono::steady_clock::now();
@@ -489,7 +438,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
     timing_total_.total_time_ms += frame_total_ms;
     timing_total_.count++;
     frame_count_++;
-
     // Emit a high-signal alert for slow frames with the stage breakdown.
     constexpr double slow_frame_warn_ms = 150.0;
     if (frame_total_ms >= slow_frame_warn_ms) {
@@ -507,7 +455,6 @@ void PointCloudMapperNodeV5::synced_detection_callback(
             timing_batch_addition_.average(),
             post_batch_total_ms);
     }
-
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration<double>(now - last_timing_print_).count();
     if (elapsed >= 30.0) {
