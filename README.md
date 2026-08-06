@@ -1,438 +1,303 @@
 # mapper_pkg
 
-A high-performance **ROS 2 C++ node** that builds and maintains a **real-time 3D semantic object map** from synchronized YOLO instance-segmentation detections and depth images. Designed for robotics applications such as autonomous navigation, object search, and scene understanding.
+Semantic mapping layer of the semantic-navigation thesis stack.
 
-## Overview
-
-`mapper_pkg` fuses per-frame 2D segmentation masks with aligned depth imagery to produce persistent, class-labeled 3D object representations in a global map frame. Each detected object is tracked across frames, promoted through a tentative confirmation stage, and maintained with geometry refinement, class consensus voting, and duplicate merging.
-
-### Key Capabilities
-
-- **Depth-to-3D projection** — pinhole back-projection of masked depth pixels into camera-frame point clouds.
-- **Per-detection filtering** — adaptive voxel downsampling and Euclidean clustering to reject noise and keep only the dominant spatial cluster.
-- **TF2 map-frame transformation** — clouds are transformed from the camera optical frame into a stable map frame using live TF2 lookups.
-- **Tentative track confirmation** — new detections must survive a configurable number of hits, minimum age, and confidence thresholds before being promoted into the persistent map.
-- **Hungarian (bipartite) data association** — unmatched detections are associated with existing map objects via a cost matrix combining centroid distance, oriented bounding-box IoU, image-embedding cosine similarity, and class-label penalties, solved globally with the Hungarian algorithm.
-- **Scale-aware association weights** — distance and IoU weights interpolate smoothly between tight (small-object) and permissive (large-object) regimes.
-- **Geometry fusion & OBB computation** — accumulated point clouds are merged with adaptive voxel filtering; a PCA-based oriented bounding box (OBB) is recomputed after every update.
-- **Class consensus voting** — each object maintains per-class vote counts and confidence sums; a weighted scoring formula with a hysteresis margin prevents spurious class flips.
-- **Duplicate merging** — overlapping same-class objects with IoU > 0.80 are fused into a single entry.
-- **Stale object pruning** — old objects with very few observations are automatically removed.
-- **Image-embedding tracking** — masked and unmasked CLIP-style embeddings are fused with a running average and used for both association and goal-directed similarity scoring.
-- **Goal similarity scoring** — an external text embedding is matched against each object's image embedding to produce a per-object relevance score (useful for "find object X" queries).
-- **Colored point-cloud visualization** — the full map is published as an XYZRGB cloud with deterministic per-object CRC32-based coloring for RViz visualization.
-- **Periodic performance reporting** — detailed per-stage timing statistics are printed every 30 seconds.
-
-## Architecture
-
-### Detailed Block Diagram (mapper internals)
+`mapper_node` fuses the 2D instance masks from `yolo11_seg_bringup` with aligned depth to build a
+persistent **3D semantic object map**: one entry per physical object, tracked across frames, with an
+oriented bounding box, a consensus class label, a fused SigLIP embedding, and a goal-relevance score.
+It is the bridge between per-frame perception and the room-level reasoning done downstream.
 
 ```
-Inputs
-  ┌─────────────────────────────────────────────┐
-  │ /camera/.../camera_info                     │
-  │  -> fx, fy, cx, cy                          │
-  └──────────────────────┬──────────────────────┘
-                         │
-  ┌──────────────────────▼──────────────────────┐
-  │ /vision/detections (DetectedObjectV3Array)  │
-  │ /camera/.../image_raw (depth)               │
-  │  -> ApproximateTime sync                    │
-  └──────────────────────┬──────────────────────┘
-                         │ synced callback
-                         ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ PointCloudMapperNodeV5                                                      │
-│                                                                              │
-│  (A) Depth preprocessing                                                    │
-│      - CV conversion (16UC1 mm -> 32FC1 m)                                 │
-│      - bilateralFilter(depth, d=5, sigmaColor=0.05, sigmaSpace=5)          │
-│      - TF lookup map <- camera                                              │
-│                                                                              │
-│  (B) Per-detection geometry extraction                                      │
-│      - decode mask                                                          │
-│      - masked depth back-projection (pinhole)                              │
-│      - adaptive voxel + adaptive SOR                                        │
-│      - reject tiny clouds (<4 pts)                                          │
-│      - transform cloud camera->map                                          │
-│                                                                              │
-│  (C) Batch handoff                                                          │
-│      add_detections_batch(names, track_ids, conf, cloud_map, embeddings)   │
-└───────────────────────────────┬──────────────────────────────────────────────┘
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ SemanticObjectMapV5                                                         │
-│                                                                              │
-│  1) Fast route: tracker_id -> map_id (if bound and class-consistent)        │
-│  2) For remaining detections: Hungarian association                          │
-│      Stage-1 prune: distance + class penalty (Top-K keep)                   │
-│      Stage-2 full score: dist + OBB overlap + embedding + class penalty     │
-│      Global one-to-one assignment via Hungarian                              │
-│      Accept only if cost < MAX_COST                                          │
-│  3) Matched => update_object: geometry fuse + OBB recompute + voting/EMA    │
-│  4) Unmatched => tentative tracks; promote when maturity constraints pass    │
-│  5) Cleanup: duplicate merge (same class, overlap > 0.80), stale pruning     │
-└───────────────────────────────┬──────────────────────────────────────────────┘
-                                │
-                                ▼
-Outputs
-  ┌─────────────────────────────────────────────┐
-  │ /vision/semantic_map_v5                     │
-  │  - id, class, pose, OBB, embeddings, score │
-  └─────────────────────────────────────────────┘
-  ┌─────────────────────────────────────────────┐
-  │ /vision/semantic_map_v5/points              │
-  │  - colored XYZRGB fused map cloud           │
-  └─────────────────────────────────────────────┘
-
-Side input (goal relevance):
-  /vision/text_embedding -> set_text_embedding(embedding, logit_scale, bias)
-  used in get_goal_similarity() during publish
+yolo11_seg_bringup ──/vision/detections──▶ mapper_node ──/vision/semantic_map_v5──▶ cluster_assignment_node
+      (masks, embeddings, tracker IDs)          │                                   cpp_mapper_json_exporter
+                                                │                                   bt_pkg
+depth + camera_info ────────────────────────────┘
+/vision/text_embedding ─────────────────────────┘
 ```
 
-## Subscribed Topics
-
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/camera/camera/aligned_depth_to_color/camera_info` | `sensor_msgs/CameraInfo` | Camera intrinsics (required before processing begins) |
-| `/vision/detections` (configurable) | `yolo11_seg_interfaces/DetectedObjectV3Array` | Per-frame instance segmentation detections with masks, class labels, confidence, tracker IDs, and optional image embeddings |
-| `/camera/camera/aligned_depth_to_color/image_raw` | `sensor_msgs/Image` | Aligned depth image (16UC1 in mm or 32FC1 in meters) |
-| `/vision/text_embedding` | `std_msgs/Float32MultiArray` | Goal text embedding vector (with logit scale and bias appended) for similarity scoring |
-
-## Published Topics
-
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/vision/semantic_map_v5` | `yolo11_seg_interfaces/SemanticObjectArray` | Full semantic object map: IDs, class names, poses, OBB corners, orientations, sizes, occurrences, confidence, embeddings, and similarity scores |
-| `/vision/semantic_map_v5/points` (configurable) | `sensor_msgs/PointCloud2` | Colored XYZRGB point cloud of all tracked objects for RViz visualization |
-
-## Parameters
-
-### General
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `detection_message` | `/vision/detections` | Topic name for detection input |
-| `map_frame` | `map` | Target TF frame for the global map |
-| `camera_frame` | `camera_color_optical_frame` | Camera optical frame ID |
-| `output_dir` | (workspace path) | Directory for map export output |
-| `output_map_file` | `map_v6.json` | Filename for exported map (reserved for future file-based export on shutdown) |
-| `stable_pointcloud_topic` | `/vision/semantic_map_v5/points` | Topic for visualization point cloud |
-| `publish_stable_pointcloud` | `true` | Enable/disable point cloud publishing |
-| `viewer_enabled` | `true` | Enable/disable RViz visualization publisher |
+The package builds **two** executables: `mapper_node` (the object map, described below) and
+`sem_mapper` (a separate scene-level grid, see §7).
 
-### Depth Filtering
+---
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `min_range` | `0.1` | Minimum valid depth in meters |
-| `max_range` | `3.0` | Maximum valid depth in meters |
-
-### Voxel Filtering
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `do_voxel_filtering` | `false` | Enable adaptive voxel downsampling on input clouds |
-| `voxel_size` | `0.12` | Base voxel leaf size (meters) |
-| `min_point_count` | `4000` | Point count below which the minimum voxel size is used |
-| `max_point_count` | `30000` | Point count above which the maximum voxel size is used |
-| `min_voxel_size` | `0.008` | Smallest adaptive voxel leaf size |
-| `max_voxel_size` | `0.050` | Largest adaptive voxel leaf size |
+## 1. Models
 
-### Euclidean Clustering
+This package runs **no neural network**. It consumes what `yolo11_seg_bringup` produces, which makes
+the interface contract the important thing:
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `cluster_tolerance` | `0.06` | Spatial tolerance for cluster membership (meters) |
-| `min_cluster_size` | `5` | Minimum points in a valid cluster |
-| `max_cluster_size` | `50000` | Maximum points in a valid cluster |
-
-## Processing Pipeline
-
-Each synchronized callback executes:
+| Input | Used for |
+|---|---|
+| `image_embedding_masked` (per detection) | fused into the object entry with a running average; the **image-image cosine** term in the association cost |
+| `image_embedding_unmasked` | fused and republished; not used in association |
+| `similarity` (per detection) | the vision node's SigLIP goal score — kept as a **running max** per object |
+| `instance_id` (BoT-SORT tracker ID) | the cheap association fast path |
+| `/vision/text_embedding` | stored with its `logit_scale` / `logit_bias` for `get_goal_similarity()` |
 
-1. Convert depth to meters and smooth depth.
-2. Get TF transform (`source_frame -> map_frame`) for current depth timestamp.
-3. For each detection:
-   - decode mask
-   - project mask pixels to 3D cloud
-   - adaptive voxel/SOR filtering
-   - reject if too few points
-   - transform cloud to map frame
-4. Batch association and state update in `add_detections_batch()`:
-   - direct tracker binding update when valid
-   - Hungarian association for unresolved detections
-   - matched -> update confirmed objects
-   - unmatched -> update/create tentative tracks, promote when mature
-5. Post-update map maintenance:
-   - geometry refinement per object
-   - duplicate resolution
-   - stale object pruning
-6. Publish semantic map and optional colored map cloud.
+**Where the published `similarity` actually comes from.** The mapper stores the goal text embedding and
+implements `get_goal_similarity()` (sigmoid over `dot × scale + bias`), but `publish_semantic_map()`
+does **not** call it. It publishes `entry.similarity` — the highest per-frame score the vision node ever
+reported for that object ([semantic_object_map.cpp:453-456](src/semantic_object_map.cpp#L453-L456),
+[mapper_node.cpp:552-555](src/mapper_node.cpp#L552-L555)).
 
-## Pipeline Math (Detailed)
+The reason is in the code comment: object embeddings are time-averaged across observations, and SigLIP's
+logit scale is steep enough that averaging over good and bad viewpoints collapses the score toward zero.
+Taking the max over per-frame scores keeps the evidence from the one good look at the object. The
+consequence is that **the score does not decay** — an object that scored high once keeps that score even
+after the prompt changes, until the map entry is pruned.
 
-Notation: pixel `(u,v)`, depth `z`, camera intrinsics `(fx, fy, cx, cy)`, 3D point `p=[x,y,z]^T`.
+Embeddings are L2-normalized and fused with a count-weighted running average:
+`fused = normalize((cw·current + nw·new) / (cw + nw))`.
 
-### 1) Depth conversion and smoothing
+---
 
-- If depth image is `16UC1` (mm):  
-  `z_meters = z_raw * 0.001`
-- Otherwise depth is already `32FC1` meters.
-- 2D bilateral filtering is applied:
-  - diameter `d = 5`
-  - `sigmaColor = 0.05` (meters)
-  - `sigmaSpace = 5.0` (pixels)
+## 2. Pipeline
 
-### 2) Pinhole back-projection (mask -> 3D cloud)
+`/vision/detections` and the depth image are joined by an `ApproximateTime` synchronizer (queue 10).
+Per synchronized callback:
 
-For every masked pixel with valid depth (`min_range <= z <= max_range`):
+1. **Depth prep** — `16UC1` mm → `32FC1` m, then a bilateral filter (`d=5`, `sigmaColor=0.05` m,
+   `sigmaSpace=5` px) that smooths noise without blurring across depth discontinuities. TF
+   `depth frame → map` is looked up at the depth timestamp (0.10 s tolerance); if the frames match, the
+   transform is skipped entirely, which is what makes camera-only testing possible.
+2. **Per detection** — decode the `mono8` mask, resize to depth resolution if needed, back-project every
+   masked pixel with valid depth through the pinhole model, adaptively voxel-downsample and SOR-filter,
+   then transform the cloud into the map frame. Detections that end up with an empty cloud are dropped.
+3. **Batch association** — the surviving clouds, names, tracker IDs, confidences, similarities and
+   embeddings go to `add_detections_batch()` in one call (§3).
+4. **Post-update** — the mutex is **released** before the expensive tail, so new frames can be processed
+   while this one finishes: geometry refinement per object, duplicate merge, stale pruning, then publish.
 
-- `x = (u - cx) * z / fx`
-- `y = (v - cy) * z / fy`
-- `z = z`
+Timing is instrumented per stage and a 12-row table is printed every 30 s; any frame over 150 ms also
+triggers an immediate breakdown at ERROR level.
 
-This creates per-detection cloud `C_det` in camera frame.
+### Adaptive filtering
 
-### 3) Adaptive filtering
+Filter strength scales with cloud density rather than being fixed — a sparse cloud from a small or
+distant object cannot afford aggressive downsampling, a dense nearby one cannot afford not to. Given
+raw point count `n`, with `t = (n − min_point_count) / (max_point_count − min_point_count)` clamped to
+`[0,1]`:
 
-Given raw point count `n`:
+```
+voxel_size  = min_voxel_size + t·(max_voxel_size − min_voxel_size)
+sor_mean_k  = min_sor_k      + t·(max_sor_k      − min_sor_k)
+sor_stddev  = min_sor_stddev + t·(max_sor_stddev − min_sor_stddev)
+```
 
-- For `n <= min_point_count`: use minimum voxel/SOR settings.
-- For `n >= max_point_count`: use maximum voxel/SOR settings.
-- Else linear interpolation:
-  - `t = (n - min_point_count) / (max_point_count - min_point_count)`
-  - `voxel_size = min_voxel_size + t*(max_voxel_size - min_voxel_size)`
-  - `sor_mean_k = min_sor_k + t*(max_sor_k - min_sor_k)`
-  - `sor_stddev = min_sor_stddev + t*(max_sor_stddev - min_sor_stddev)`
+### Oriented bounding box
 
-Then:
-- optional VoxelGrid downsampling
-- optional StatisticalOutlierRemoval
+PCA on the accumulated cloud: centroid → covariance → eigenvectors, forced right-handed with
+`e3 = e1 × e2`, points projected into the local frame, min/max giving the extents. Recomputed after
+every geometry fusion. If the OBB is degenerate the pose falls back to the raw centroid.
 
-### 4) Camera->map transform
+### Overlap proxy
 
-With TF transform `(R, t)` from source frame to map:
+True OBB-OBB IoU is expensive, so overlap is sampled: up to ~50 points from each cloud, `r12` = fraction
+of cloud 1 inside OBB 2, `r21` = the reverse, `overlap = clamp(0.5·(r12 + r21), 0, 1)`.
+
+---
 
-- `p_map = R * p_cam + t`
+## 3. Association
+
+Three tiers, cheapest first.
 
-Quaternion from TF is normalized before building `R`.
+**Tier 0 — tracker binding.** If the detection's BoT-SORT ID is already bound to a map object and the
+class is consistent, update directly. No geometry, no solver. This is the common case and it is why the
+vision node runs `track()` rather than `predict()`.
 
-### 5) OBB (oriented bounding box) from PCA
+**Tier 1 — cheap shortlist.** For every remaining detection × object pair: a hard spatial gate
+`dist ≤ max(0.4, 1.2·max_size)` blocks unrealistic pairs, then
 
-For cloud `C`:
+```
+cheap_cost = w_dist(size)·dist + class_penalty        class_penalty = 3.0 if labels differ else 0
+```
 
-1. centroid `c = mean(C)`
-2. covariance `Σ = cov(C)`
-3. eigenvectors `E = [e1 e2 e3]` from `Σ`
-4. enforce right-handed basis: `e3 = e1 × e2`
-5. project points into local PCA frame:
-   - `p_local = E^T (p - c)`
-6. local min/max bounds -> extents:
-   - `extent_x = max_x - min_x`, similarly for `y,z`
+Only the **top 3** cheapest candidates per detection survive; everything else is set to `kBlockedCost`
+(999) and never scored again.
 
-Stored OBB:
-- center `c`
-- extents `(L,W,H)`
-- rotation matrix `E`
+**Tier 2 — full cost on the shortlist**, solved globally one-to-one with the Hungarian algorithm:
 
-### 6) Overlap proxy (used as IoU-like term)
-
-`compute_obb_iou()` uses orientation-aware overlap ratio:
-
-- sample up to ~50 points from each cloud
-- compute:
-  - `r12 = fraction(points1 inside obb2)`
-  - `r21 = fraction(points2 inside obb1)`
-- overlap proxy:
-  - `overlap = clamp(0.5*(r12 + r21), 0, 1)`
-
-### 7) Embedding normalization and similarity
-
-For embedding vector `e`:
-
-- normalize: `e_hat = e / ||e||_2`
-
-Image-image similarity:
-
-- `sim = dot(e_hat1, e_hat2)` (cosine because normalized)
-- clamped to `[0,1]`
-
-Running embedding fusion:
-
-- `fused = normalize((cw*cur + nw*new)/(cw+nw))`
-
-where `cw` and `nw` are effective counts.
-
-### 8) Association math (Hungarian stage)
-
-For each unmatched detection `i` and map object `j`:
-
-1. centroid distance:
-   - `dist_ij = ||center_det_i - center_map_j||_2`
-
-2. class mismatch penalty:
-   - `penalty_ij = max_class_penalty` if classes differ, else `0`
-
-3. scale-aware weights (object-size dependent):
-   - let `s = max(max_extent_det, max_extent_map)`
-   - if `s < small_size`: use `(w_dist_small, w_iou_small)`
-   - if `s > large_size`: use `(w_dist_large, w_iou_large)`
-   - else interpolate linearly with ratio  
-     `r = (s-small_size)/(large_size-small_size)`
-
-4. hard distance gate:
-   - `dist_ij <= max(0.4, 1.2*s)` else blocked
-
-5. Stage-1 cheap score (for Top-K shortlist):
-   - `cheap_ij = w_dist(s)*dist_ij + penalty_ij`
-
-6. Stage-2 full score (only shortlisted pairs):
-   - `iou_ij = overlap_proxy(det_i, map_j)`
-   - `cost_sem_ij = 1 - sim_embedding_ij` (or `1` if embedding unavailable)
-   - Final:
-     - `cost_ij = w_dist(s)*dist_ij + w_iou(s)*(1 - iou_ij) + w_sem*cost_sem_ij + penalty_ij`
-
-Hungarian solves global one-to-one assignment on `cost_ij`.
-
-Acceptance rule:
-- assigned and `cost_ij < MAX_COST` (default `4.5`) -> match accepted
-- otherwise detection goes to tentative pipeline
-
-### 9) Tentative track promotion logic
-
-A tentative track is promoted only when all are true:
-
-- `hits >= confirmation_min_hits` (default `5`)
-- `age_sec >= confirmation_min_age_sec` (default `1.0`)
-- `confidence_max >= min_confidence_for_promotion` (default `0.6`)
-- `avg_conf = confidence_sum/hits >= min_avg_confidence_for_promotion` (default `0.55`)
-
-Also, low-confidence inputs are rejected before tentative update:
-- `confidence >= min_input_confidence` (default `0.55`)
-
-### 10) Confirmed object update equations
-
-For accepted detection:
-
-1. geometry fusion:
-   - concatenate old/new cloud
-   - optional ICP alignment
-   - adaptive SOR + adaptive voxel
-2. recompute OBB and pose from fused cloud
-3. class evidence:
-   - `class_count[name] += 1`
-   - `class_conf_sum[name] += confidence`
-4. class score per label:
-   - `score(name) = class_count_weight*count(name) + class_confidence_weight*avg_conf(name)`
-5. hysteresis lock:
-   - if current label has enough votes and challenger margin is small, keep current class
-6. confidence EMA:
-   - `conf_ema = (1-α)*conf_ema + α*confidence` with `α = confidence_ema_alpha` (default `0.20`)
-
-### 11) Duplicate merge and stale pruning
-
-- Duplicate merge condition:
-  - same class AND overlap proxy `> 0.80`
-- Wrong/stale object removal condition:
-  - `age_sec > kMaxAgeSec` (default `20.0`)
-  - AND `occurrences < kMinOccurrences` (default `50`)
-- Tentative and track-binding stale state are also pruned with TTL windows.
-
-### 12) Goal similarity scoring math (published per object)
-
-Given text embedding `t`, object image embedding `e`, logit scale `s`, bias `b`:
-
-1. `dot = <e, t>`
-2. `logits = dot*s + b`
-3. `logits_clipped = clamp(logits, -60, 60)`
-4. `score = sigmoid(logits_clipped) * 100`
-
-Current output uses masked embedding score (`1.0*masked + 0.0*unmasked`).
-
-## Dependencies
-
-### ROS 2 Packages
-
-- `rclcpp`
-- `std_msgs`, `sensor_msgs`, `geometry_msgs`
-- `message_filters`
-- `tf2`, `tf2_ros`, `tf2_geometry_msgs`
-- `cv_bridge`
-- `pcl_conversions`, `pcl_ros`
-- `yolo11_seg_interfaces` — custom message package providing `DetectedObjectV3Array`, `SemanticObjectArray`, and `SemanticObject`
-
-### System Libraries
-
-- **OpenCV** — image conversion and mask processing
-- **Eigen3** — fast matrix math for transforms, PCA, and cosine similarity
-- **PCL** (Point Cloud Library) — voxel filtering, Euclidean clustering, OBB computation, point cloud transforms
-- **zlib** — CRC32 for deterministic per-object coloring
-
-### Third-Party Source
-
-- **Hungarian algorithm** — C++ implementation by Cong Ma (BSD license), included in-tree as `src/Hungarian.cpp` and `include/mapper_pkg/Hungarian.h`
-
-## Building
-
-This package uses the **ament_cmake** build system. Build it inside a ROS 2 workspace:
+```
+cost = w_dist(size)·dist + w_iou(size)·(1 − overlap) + 2.5·(1 − cos_sim_embedding) + class_penalty
+```
+
+`cos_sim_embedding` uses the **masked** embeddings; when either side has none, the semantic term
+defaults to its worst value (1.0). An assignment is accepted only if `cost < MAX_COST` (4.0); otherwise
+the detection falls through to the tentative pipeline.
+
+**Scale-aware weights.** A 5 cm cup and a 2 m fridge need different notions of "close". The weights
+interpolate on `max_size`, the larger extent of the two candidates:
+
+| | small (`≤ 0.2 m`) | large (`≥ 2.0 m`) |
+|---|---|---|
+| `w_dist` | 5.0 | 0.2 |
+| `w_iou` | 4.0 | 0.3 |
+
+Small objects are dominated by position (a few centimetres off means a different cup); large objects
+lean on overlap and embedding, because their centroids move as more of the surface is observed.
+
+**Tentative tracks.** Unmatched detections create tentative tracks that are promoted into the map only
+when *all* of: `hits ≥ 5`, `age ≥ 1.0 s`, `max confidence ≥ 0.6`, `mean confidence ≥ 0.55`. Detections
+below `min_input_confidence` (0.55) never even reach this stage. Tentative tracks go stale after 2.0 s,
+tracker bindings after 4.0 s.
+
+**Confirmed update.** Clouds are concatenated and re-voxelized (no ICP — the alignment step in
+`fuse_geometry` is a passthrough), the OBB is recomputed, and class evidence accumulates as
+`score(label) = 1.0·count(label) + 2.0·mean_conf(label)`. A **hysteresis lock** keeps the current label
+once it has ≥ 4 votes unless a challenger beats it by more than 0.75, which stops objects flickering
+between visually similar classes. Confidence is an EMA with `α = 0.20`.
+
+**Cleanup.** Same-class objects with overlap > 0.80 are merged; objects older than 20 s with fewer than
+50 occurrences are pruned as false positives.
+
+---
+
+## 4. Interface
+
+### Subscribed
+
+| Topic (default) | Type | Parameter |
+|---|---|---|
+| `/vision/detections` | `DetectedObjectV3Array` | `detection_message` |
+| `/jackal/sensors/camera_0/aligned_depth_to_color/image` | `sensor_msgs/Image` | `depth_topic` |
+| `/jackal/sensors/camera_0/aligned_depth_to_color/camera_info` | `sensor_msgs/CameraInfo` | `camera_info_topic` |
+| `/vision/text_embedding` | `std_msgs/Float32MultiArray` | `vision_topic` |
+
+Intrinsics are latched from the **first** `CameraInfo` message; frames are skipped until it arrives.
+The text-embedding message is the embedding vector with `logit_scale` and `logit_bias` appended as the
+last two elements.
+
+### Published
+
+| Topic | Type | Notes |
+|---|---|---|
+| `/vision/semantic_map_v5` | `SemanticObjectArray` | id, class, poses, OBB (size + quaternion + 8 corners), occurrences, confidence EMA, both embeddings, similarity |
+| `/vision/semantic_map_v5/points` | `sensor_msgs/PointCloud2` | XYZRGB fused map cloud, colour from CRC32 of the object ID |
+
+### Parameters
+
+| Parameter | Default | |
+|---|---|---|
+| `detection_message` | `/vision/detections` | |
+| `map_frame` | `map` | |
+| `camera_frame` | `camera_0_color_optical_frame` | fallback when the depth header has no `frame_id` |
+| `depth_topic` / `camera_info_topic` / `vision_topic` | see table above | |
+| `stable_pointcloud_topic` | `/vision/semantic_map_v5/points` | |
+| `publish_stable_pointcloud` / `viewer_enabled` | `true` / `true` | both must be true to publish the cloud |
+| `export_interval` | `5.0` s | **heartbeat/diagnostic timer, not a file export** |
+| `output_dir` / `output_map_file` | — | declared but unused; JSON export is done by `cpp_mapper_json_exporter_node` in `yolo11_seg_bringup` |
+| `min_range` / `max_range` | `0.1` / `6.0` m | valid depth window |
+| `do_voxel_filtering` | `true` | |
+| `voxel_size` | `0.05` | overwritten every frame by the adaptive rule |
+| `min_point_count` / `max_point_count` | `800` / `5000` | adaptation endpoints |
+| `min_voxel_size` / `max_voxel_size` | `0.01` / `0.08` | |
+| `do_sor_` | `true` | note the trailing underscore in the parameter name |
+| `sor_mean_k`, `min_sor_k`, `max_sor_k` | `50`, `20`, `120` | |
+| `sor_stddev_mul_thresh`, `min_…`, `max_…` | `1.0`, `1.0`, `1.0` | |
+
+Association, promotion, class-consensus and pruning constants are **not** ROS parameters — they are
+members of `SemanticObjectMapV5` in
+[semantic_object_map.hpp:90-142](include/mapper_pkg/semantic_object_map.hpp#L90-L142). Changing them
+means recompiling.
+
+---
+
+## 5. What you need to run it
+
+**Build dependencies.** ROS 2 Humble plus `rclcpp`, `std_msgs`, `sensor_msgs`, `geometry_msgs`,
+`message_filters`, `tf2`/`tf2_ros`/`tf2_geometry_msgs`/`tf2_sensor_msgs`, `cv_bridge`,
+`pcl_conversions`, `pcl_ros`, `nav_msgs`, `grid_map_ros`/`grid_map_msgs`/`grid_map_core`, and system
+OpenCV, Eigen3, PCL (`common io filters features`), zlib. `grid_map_*` is needed even if you only want
+`mapper_node`, because both executables are in one CMake project.
+
+**`yolo11_seg_interfaces`** — external message package, required. Must provide `DetectedObjectV3Array`,
+`SemanticObject`, `SemanticObjectArray`, `Similarity`, `SimilarityCentroid`, `SimilarityCentroidArray`.
+
+**The Hungarian solver** is vendored in-tree (`src/Hungarian.cpp`, Cong Ma, BSD) — nothing to install.
+
+**At runtime you need all of:**
+
+- `pc_vision_node_v3` publishing `/vision/detections` — without it there is nothing to map
+- a depth stream **aligned to colour**, plus its `CameraInfo`
+- TF resolving `depth frame → map` at the depth timestamps (i.e. SLAM or localization running)
+
+Build:
 
 ```bash
-# Source your ROS 2 installation
-source /opt/ros/<distro>/setup.bash
-
-# Clone into your workspace (ensure yolo11_seg_interfaces is also present)
-cd ~/ros2_ws/src
-git clone <this-repo-url> mapper_pkg
-
-# Install dependencies
-cd ~/ros2_ws
-rosdep install --from-paths src --ignore-src -r -y
-
-# Build
-colcon build --packages-select mapper_pkg
-
-# Source the workspace
+cd /home/workspace/ros2_ws
+colcon build --packages-select yolo11_seg_interfaces mapper_pkg
 source install/setup.bash
 ```
 
-## Running
+Run:
 
 ```bash
 ros2 run mapper_pkg mapper_node
 ```
 
-Override parameters at launch:
+Override for a different camera:
 
 ```bash
 ros2 run mapper_pkg mapper_node --ros-args \
-  -p detection_message:=/my/detections \
-  -p map_frame:=odom \
-  -p max_range:=5.0 \
-  -p publish_stable_pointcloud:=true
+  -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw \
+  -p camera_info_topic:=/camera/camera/aligned_depth_to_color/camera_info \
+  -p camera_frame:=camera_color_optical_frame \
+  -p max_range:=5.0
 ```
 
-Or use a launch file that remaps topics and sets parameters as needed for your robot platform.
+The node is spun on a `MultiThreadedExecutor` so the heartbeat timer keeps reporting even when the sync
+callback is busy.
 
-## Performance
+### Diagnosing a silent mapper
 
-Timing statistics are printed to stdout every 30 seconds. Example output from a representative run:
+The heartbeat exists because the failure modes are quiet. If nothing appears on
+`/vision/semantic_map_v5`, the log tells you which stage is starving:
 
-| Step | Avg Time (ms) |
-|------|---------------|
-| Depth Conversion | ~0.5 |
-| Point Extraction | ~1.1–1.4 |
-| Filtering (Voxel + Cluster) | ~6.6–28.4 |
-| Transform to Map | ~0.003 |
-| Batch Addition (Matching) | ~40–78 |
-| Publishing | ~1.8–4.8 |
-| **Total per frame** | **~63–291** |
+| Log | Meaning |
+|---|---|
+| `camera intrinsics are not ready` | no `CameraInfo` — wrong topic |
+| `cannot transform … -> map` | TF gap; check SLAM and the depth `frame_id` |
+| `no synced callbacks for … ms` with non-zero `mask_msgs`/`depth_msgs` | both streams arrive but timestamps don't align — the usual cause is a camera driver not stamping depth and colour consistently |
+| `no detections survived filtering` | clouds too small; check `min_range`/`max_range` and mask quality |
+| `no completed synced callbacks yet` | nothing has ever matched — topic names |
 
-Performance depends heavily on the number of detections per frame, point cloud density, and the size of the persistent object map.
+---
+
+## 6. Caveats
+
+- **No ICP.** `fuse_geometry` copies the new cloud and concatenates; the `aligned_new` variable is a
+  leftover from an alignment step that is not there.
+- **Association constants require a rebuild** — they are not ROS parameters.
+- **Default topics are Jackal-specific.** `yolo11_seg_bringup` defaults to the same camera; if you remap
+  one end, remap both.
+- The node-level `voxel_size` / `sor_mean_k` / `sor_stddev_mul_thresh` parameters are **overwritten on
+  every detection** by the adaptive rule; only the `min_*`/`max_*` bounds have lasting effect.
+
+---
+
+## 7. `sem_mapper` — scene-level semantic grid (separate executable)
+
+An independent experiment, not part of the object-map pipeline. It maintains a `grid_map` with an
+`occupancy` layer and a `similarity` layer: the **scene-level** SigLIP score from
+`scene_embedding_node` (`/vision/scene_similarity_raw`) is painted into the camera FOV wedge, so the
+grid accumulates "how much did this region look like the prompt". It then extracts frontiers that
+border unknown space, filters out those too close to walls or within 0.3 m of the robot, clusters them,
+and publishes cluster centroids with their mean similarity.
+
+- **Subscribes:** `/map`, `/jackal/sensors/camera_0/aligned_depth_to_color/camera_info` (FOV is derived
+  from `2·atan(width / 2fx)`), `/vision/scene_similarity_raw`
+- **Publishes:** `/semantic_grid_map` (`grid_map_msgs/GridMap`, 5 Hz), `/frontiers` and `/clusters`
+  (markers), `/similarity_centroids_data` (`SimilarityCentroidArray`)
+- **Consumer:** `semantic_navigator.py` in `yolo11_seg_bringup` — see the caveat there about its
+  inverted similarity term
+
+```bash
+ros2 run mapper_pkg sem_mapper
+```
+
+Note it subscribes to `/map`, not `/jackal/map` like the rest of the stack.
+
+---
 
 ## License
 
-Apache-2.0 — see [package.xml](package.xml) for details.
-
-The bundled Hungarian algorithm implementation is licensed under the BSD license.
+Apache-2.0. The bundled Hungarian implementation (Cong Ma) is BSD.
