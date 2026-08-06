@@ -52,6 +52,13 @@ Embeddings are L2-normalized and fused with a count-weighted running average:
 
 ## 2. Pipeline
 
+![Mapper node internals](images/mapper_node.png)
+
+*Inside `mapper_node`. The detection message splits: the masks go up into the geometry path, where they
+gate which depth pixels get back-projected, while the class, embeddings and tracker IDs go straight
+across to data association. Geometry and semantics only meet at the matcher — which is why the
+association cost can combine a distance term with an embedding term (§3).*
+
 `/vision/detections` and the depth image are joined by an `ApproximateTime` synchronizer (queue 10).
 Per synchronized callback:
 
